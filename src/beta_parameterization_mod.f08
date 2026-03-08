@@ -50,6 +50,9 @@ module beta_parameterization_mod
     !> Main entry point: validates shape and computes radius grid
     public :: compute_legendre_radius_grid_s
 
+    !> Standalone wrapper: internalizes all precomputation
+    public :: compute_legendre_radius_grid_standalone_s
+
     !---------------------------------------------------------------------------
     ! Public Interface - Components
     !---------------------------------------------------------------------------
@@ -229,6 +232,106 @@ contains
         message = ''
 
     end subroutine compute_legendre_radius_grid_s
+
+    !===========================================================================
+    ! STANDALONE WRAPPER
+    !===========================================================================
+
+    !> Standalone wrapper that internalizes all precomputation.
+    !!
+    !! Unlike compute_legendre_radius_grid_s, this routine does not require
+    !! the caller to precompute normalization constants, Legendre polynomial
+    !! grids, or Gauss-Legendre quadrature nodes/weights.
+    !!
+    !! @param[in]  params              Shape parameters (β values), λ=1..size(params)
+    !! @param[in]  n_grid              Number of grid points for R(θ) output
+    !! @param[out] radii               R(θ) values at grid points (size n_grid)
+    !! @param[out] corrected_beta10    The (possibly corrected) β₁₀ value
+    !! @param[out] is_valid            True if shape is valid
+    !! @param[out] message             Error message if invalid
+    !! @param[in]  apply_com_correction Optional: apply COM correction (default .false.)
+    !! @param[in]  n_quad_in           Optional: number of GL quadrature points
+    subroutine compute_legendre_radius_grid_standalone_s( &
+            params, n_grid, &
+            radii, corrected_beta10, is_valid, message, &
+            apply_com_correction, n_quad_in)
+
+        use mathematical_utilities_mod, only: &
+                compute_spherical_harmonics_normalization_constants_s, &
+                compute_gauss_legendre_quadrature_s, &
+                compute_legendre_polynomials_s
+
+        implicit none
+
+        real(kind = rk), intent(in) :: params(:)
+        integer(kind = ik), intent(in) :: n_grid
+        real(kind = rk), intent(out) :: radii(n_grid)
+        real(kind = rk), intent(out) :: corrected_beta10
+        logical, intent(out) :: is_valid
+        character(len = *), intent(out) :: message
+        logical, intent(in), optional :: apply_com_correction
+        integer(kind = ik), intent(in), optional :: n_quad_in
+
+        ! Local variables
+        integer(kind = ik) :: n_def_params, n_quad, i
+        real(kind = rk), allocatable :: norm_constants(:)
+        real(kind = rk), allocatable :: gl_nodes(:), gl_weights(:)
+        real(kind = rk), allocatable :: legendre_theta_grid(:, :)
+        real(kind = rk), allocatable :: legendre_gl(:, :)
+        real(kind = rk) :: h, theta, x
+
+        n_def_params = size(params, kind = ik)
+
+        ! Guard against empty parameter array
+        if (n_def_params < 1_ik) then
+            radii = 0.0_rk
+            corrected_beta10 = 0.0_rk
+            is_valid = .false.
+            message = 'Empty parameter array'
+            return
+        end if
+
+        ! Compute normalization constants C_λ
+        allocate(norm_constants(n_def_params))
+        call compute_spherical_harmonics_normalization_constants_s( &
+                norm_constants, n_def_params)
+
+        ! Determine number of GL quadrature points
+        if (present(n_quad_in)) then
+            n_quad = n_quad_in
+        else
+            n_quad = max(2_ik * n_def_params + 1_ik, 20_ik)
+        end if
+
+        ! Compute GL nodes and weights
+        allocate(gl_nodes(n_quad), gl_weights(n_quad))
+        call compute_gauss_legendre_quadrature_s(n_quad, gl_nodes, gl_weights)
+
+        ! Precompute Legendre polynomials on the θ grid
+        h = PI_C / real(n_grid - 1_ik, rk)
+        allocate(legendre_theta_grid(n_grid, n_def_params + 1))
+        do i = 1_ik, n_grid
+            theta = real(i - 1_ik, rk) * h
+            x = cos(theta)
+            call compute_legendre_polynomials_s( &
+                    n_def_params + 1_ik, x, legendre_theta_grid(i, :))
+        end do
+
+        ! Precompute Legendre polynomials at GL nodes
+        allocate(legendre_gl(n_quad, n_def_params + 1))
+        do i = 1_ik, n_quad
+            call compute_legendre_polynomials_s( &
+                    n_def_params + 1_ik, gl_nodes(i), legendre_gl(i, :))
+        end do
+
+        ! Delegate to the existing routine
+        call compute_legendre_radius_grid_s( &
+                params, n_grid, norm_constants, legendre_theta_grid, &
+                gl_nodes, gl_weights, legendre_gl, &
+                radii, corrected_beta10, is_valid, message, &
+                apply_com_correction)
+
+    end subroutine compute_legendre_radius_grid_standalone_s
 
     !===========================================================================
     ! SHAPE VALIDATION

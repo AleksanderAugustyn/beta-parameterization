@@ -35,8 +35,14 @@ endif ()
 include(GCCCompilerOptions/FortranCompilerOptions)
 create_fortran_library_interface(TARGET beta_parameterization_flags)
 
-# --- Library target ---
-add_library(beta_parameterization STATIC src/beta_parameterization_mod.f08)
+# --- Source files ---
+set(BETA_PARAM_SOURCES
+        src/beta_parameterization_mod.f08
+        src/beta_parameterization_c_api_mod.f08
+)
+
+# --- Static library target ---
+add_library(beta_parameterization STATIC ${BETA_PARAM_SOURCES})
 target_link_libraries(beta_parameterization
         PUBLIC fortran_foundations
         PRIVATE beta_parameterization_flags
@@ -50,6 +56,29 @@ set_target_properties(beta_parameterization PROPERTIES
         Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files
 )
 target_include_directories(beta_parameterization
-        PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files>
+        PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
 add_library(BetaParameterization::beta_parameterization ALIAS beta_parameterization)
+
+# --- Shared library target (for FFI consumers: Python ctypes, Rust, etc.) ---
+add_library(beta_parameterization_shared SHARED ${BETA_PARAM_SOURCES})
+target_link_libraries(beta_parameterization_shared
+        PUBLIC fortran_foundations
+        PRIVATE beta_parameterization_flags
+)
+target_compile_definitions(beta_parameterization_shared PRIVATE
+        $<$<CONFIG:Debug>:DEBUG>
+        $<$<CONFIG:RelWithDebInfo>:RELWITHDEBINFO>
+        $<$<CONFIG:Release>:RELEASE>
+)
+set_target_properties(beta_parameterization_shared PROPERTIES
+        Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_shared
+        OUTPUT_NAME beta_parameterization
+)
+target_include_directories(beta_parameterization_shared
+        PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files_shared>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
