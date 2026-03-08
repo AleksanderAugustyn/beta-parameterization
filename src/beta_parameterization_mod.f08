@@ -155,7 +155,7 @@ contains
 
         ! Copy parameters to local array (with zero-padding if needed)
         n_params = size(params, kind = ik)
-        beta_local = 0.0_rk
+        beta_local(:) = 0.0_rk
         beta_local(1:min(n_params, n_def_params)) = &
                 params(1:min(n_params, n_def_params))
 
@@ -175,7 +175,7 @@ contains
 
         ! Step 3: Compute R(θ) at grid points using pre-computed Legendre polynomials
         ! Precompute beta × normalization constant product
-        beta_con = beta_local * norm_constants
+        beta_con(:) = beta_local(:) * norm_constants(:)
 
         h = PI_C / real(n_grid - 1_ik, rk)
 
@@ -361,7 +361,7 @@ contains
         call compute_legendre_polynomials_s(n_def_params + 1_ik, x, legendre_polys)
 
         ! Precompute deformation parameter times normalization constant
-        beta_con = params(1:n_def_params) * norm_constants
+        beta_con(:) = params(1:n_def_params) * norm_constants(:)
 
         ! Compute radius: R(x) = 1 + Σ β_λ C_λ P_λ(x)
         r = 1.0_rk
@@ -415,7 +415,7 @@ contains
         allocate(beta_con(n_def_params))
 
         ! Precompute beta × normalization constant product
-        beta_con = beta_params * norm_constants
+        beta_con(:) = beta_params(:) * norm_constants(:)
 
         ! Initial calculation
         volume_integral = 0.0_rk
