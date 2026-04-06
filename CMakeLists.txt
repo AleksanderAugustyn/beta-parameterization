@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
 project(beta-parameterization
-        VERSION 1.1.0
+        VERSION 1.1.1
         LANGUAGES Fortran
         DESCRIPTION "Beta parameterization for nuclear physics applications"
 )
@@ -12,7 +12,7 @@ project(beta-parameterization
 FetchContent_Declare(
         GCC-Compiler-Options
         GIT_REPOSITORY https://github.com/AleksanderAugustyn/GCC-Compiler-Options.git
-        GIT_TAG 1.4.0
+        GIT_TAG 1.4.1
 )
 FetchContent_MakeAvailable(GCC-Compiler-Options)
 
@@ -20,7 +20,7 @@ FetchContent_MakeAvailable(GCC-Compiler-Options)
 FetchContent_Declare(
         Fortran-Foundations
         GIT_REPOSITORY https://github.com/AleksanderAugustyn/Fortran-Foundations.git
-        GIT_TAG 2.2.0
+        GIT_TAG 2.2.1
 )
 FetchContent_MakeAvailable(Fortran-Foundations)
 
