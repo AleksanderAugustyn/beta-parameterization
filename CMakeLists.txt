@@ -3,10 +3,14 @@ cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
 project(beta-parameterization
-        VERSION 1.1.1
-        LANGUAGES Fortran
+        VERSION 2.0.0
+        LANGUAGES Fortran CXX
         DESCRIPTION "Beta parameterization for nuclear physics applications"
 )
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 # --- Fetch GCC compiler options package ---
 FetchContent_Declare(
@@ -20,7 +24,7 @@ FetchContent_MakeAvailable(GCC-Compiler-Options)
 FetchContent_Declare(
         Fortran-Foundations
         GIT_REPOSITORY https://github.com/AleksanderAugustyn/Fortran-Foundations.git
-        GIT_TAG 2.2.1
+        GIT_TAG 2.2.2
 )
 FetchContent_MakeAvailable(Fortran-Foundations)
 
@@ -37,6 +41,7 @@ create_fortran_library_interface(TARGET beta_parameterization_flags)
 
 # --- Source files ---
 set(BETA_PARAM_SOURCES
+        src/beta_parameterization_workers_mod.f08
         src/beta_parameterization_mod.f08
         src/beta_parameterization_c_api_mod.f08
 )
@@ -82,3 +87,13 @@ target_include_directories(beta_parameterization_shared
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files_shared>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
+
+# --- C++ header-only wrapper (consumes the shared library) ---
+add_library(beta_parameterization_cxx INTERFACE)
+target_include_directories(beta_parameterization_cxx INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_link_libraries(beta_parameterization_cxx INTERFACE
+        beta_parameterization_shared)
+target_compile_features(beta_parameterization_cxx INTERFACE cxx_std_20)
+add_library(BetaParameterization::beta_parameterization_cxx
+        ALIAS beta_parameterization_cxx)
