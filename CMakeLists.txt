@@ -97,3 +97,25 @@ target_link_libraries(beta_parameterization_cxx INTERFACE
 target_compile_features(beta_parameterization_cxx INTERFACE cxx_std_20)
 add_library(BetaParameterization::beta_parameterization_cxx
         ALIAS beta_parameterization_cxx)
+
+# --- Tests ---
+enable_testing()
+
+add_library(beta_param_test_utils STATIC tests/test_utils_mod.f08)
+target_link_libraries(beta_param_test_utils
+        PUBLIC fortran_foundations
+        PRIVATE beta_parameterization_flags)
+set_target_properties(beta_param_test_utils PROPERTIES
+        Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests)
+target_include_directories(beta_param_test_utils PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests>)
+
+set(BETA_PARAM_TEST_SUITES core)
+foreach (suite IN LISTS BETA_PARAM_TEST_SUITES)
+    add_executable(beta_param_${suite}_test tests/beta_param_${suite}_test.f08)
+    target_link_libraries(beta_param_${suite}_test PRIVATE
+            beta_parameterization beta_param_test_utils beta_parameterization_flags)
+    set_target_properties(beta_param_${suite}_test PROPERTIES
+            Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/${suite})
+    add_test(NAME ${suite} COMMAND beta_param_${suite}_test)
+endforeach ()
