@@ -1,6 +1,6 @@
 /**
  * @file beta_parameterization.h
- * @brief C API for the Fortran beta parameterization library (v2.0.0).
+ * @brief C API for the Fortran beta parameterization library (v2.1.0).
  *
  * Two-tier API:
  *   - Cache-backed (recommended for batch use): create one cache up front,
@@ -12,6 +12,14 @@
  * All radius-grid functions return a status code; 0 (BETA_PARAM_VALID) means
  * success. The message buffer is always null-terminated (truncated to fit
  * if needed). Recommended buffer size: 256.
+ *
+ * Status-code notes:
+ *   BETA_PARAM_ERROR_INVALID_MAX_PARAMS (5) covers every invalid cache-init
+ *   parameter (max_beta_params outside [1, 64] or n_grid < 2), a NULL cache
+ *   handle passed to a compute function, and - through the standalone entry
+ *   points, where max_beta_params is taken as n_params - an empty params
+ *   array. On any failure, output buffers (radii, corrected_beta10) are
+ *   zero-filled.
  *
  * Thread safety:
  *   A `beta_param_cache_t*` is immutable after `beta_param_cache_create`.
@@ -91,7 +99,13 @@ int beta_param_cache_compute_radius_grid_with_com_shift(
         double* radii, double* corrected_beta10,
         int message_buf_len, char* message_buf);
 
-/* --- Standalone single-shape (one-off, inefficient for batch) --- */
+/* --- Standalone single-shape (one-off, inefficient for batch) ---
+ *
+ * Return BETA_PARAM_VALID (0) on success, an error code otherwise.
+ * max_beta_params is taken as n_params, so n_params must be in [1, 64]
+ * and n_grid >= 2; violations return BETA_PARAM_ERROR_INVALID_MAX_PARAMS.
+ * On failure, radii (and corrected_beta10) are zero-filled.
+ */
 
 int beta_param_compute_radius_grid_standalone(
         const double* params, int n_params, int n_grid,

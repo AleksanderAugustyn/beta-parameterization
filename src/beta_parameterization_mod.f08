@@ -477,6 +477,10 @@ contains
         type(cache_t)      :: cache
         integer(kind = ik) :: mbp
 
+        ! Outputs must be defined on every return path (v1 contract); the C
+        ! wrappers copy them out unconditionally.
+        radii(:) = 0.0_rk
+
         if (present(max_beta_params)) then
             mbp = max_beta_params
         else
@@ -504,6 +508,11 @@ contains
 
         type(cache_t)      :: cache
         integer(kind = ik) :: mbp
+
+        ! Outputs must be defined on every return path (v1 contract); the C
+        ! wrappers copy them out unconditionally.
+        radii(:)         = 0.0_rk
+        corrected_beta10 = 0.0_rk
 
         if (present(max_beta_params)) then
             mbp = max_beta_params

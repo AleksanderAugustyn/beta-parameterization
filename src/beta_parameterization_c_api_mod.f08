@@ -129,7 +129,7 @@ contains
         n_grid_local = cache_ptr%n_grid_get()
 
         allocate(f_params(int(n_params, ik)))
-        allocate(f_radii(n_grid_local))
+        allocate(f_radii(n_grid_local), source = 0.0_rk)
         f_params(:) = real(params(:), rk)
 
         call cache_ptr%compute_radius_grid(f_params, f_radii, error_code, f_message)
@@ -171,8 +171,9 @@ contains
         n_grid_local = cache_ptr%n_grid_get()
 
         allocate(f_params(int(n_params, ik)))
-        allocate(f_radii(n_grid_local))
+        allocate(f_radii(n_grid_local), source = 0.0_rk)
         f_params(:) = real(params(:), rk)
+        f_corrected = 0.0_rk
 
         call cache_ptr%compute_radius_grid_with_com_shift( &
                 f_params, f_radii, f_corrected, error_code, f_message)
@@ -204,7 +205,7 @@ contains
         character(len = 256) :: f_message
 
         allocate(f_params(int(n_params, ik)))
-        allocate(f_radii(int(n_grid, ik)))
+        allocate(f_radii(int(n_grid, ik)), source = 0.0_rk)
         f_params(:) = real(params(:), rk)
 
         call compute_radius_grid_standalone_s( &
@@ -236,8 +237,9 @@ contains
         character(len = 256) :: f_message
 
         allocate(f_params(int(n_params, ik)))
-        allocate(f_radii(int(n_grid, ik)))
+        allocate(f_radii(int(n_grid, ik)), source = 0.0_rk)
         f_params(:) = real(params(:), rk)
+        f_corrected = 0.0_rk
 
         call compute_radius_grid_standalone_with_com_shift_s( &
                 f_params, int(n_grid, ik), f_radii, f_corrected, error_code, f_message)
