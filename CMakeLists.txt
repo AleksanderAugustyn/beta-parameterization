@@ -110,7 +110,7 @@ set_target_properties(beta_param_test_utils PROPERTIES
 target_include_directories(beta_param_test_utils PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests>)
 
-set(BETA_PARAM_TEST_SUITES core)
+set(BETA_PARAM_TEST_SUITES core com)
 foreach (suite IN LISTS BETA_PARAM_TEST_SUITES)
     add_executable(beta_param_${suite}_test tests/beta_param_${suite}_test.f08)
     target_link_libraries(beta_param_${suite}_test PRIVATE
