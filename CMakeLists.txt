@@ -87,6 +87,8 @@ target_include_directories(beta_parameterization_shared
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files_shared>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
+add_library(BetaParameterization::beta_parameterization_shared
+        ALIAS beta_parameterization_shared)
 
 # --- C++ header-only wrapper (consumes the shared library) ---
 add_library(beta_parameterization_cxx INTERFACE)
