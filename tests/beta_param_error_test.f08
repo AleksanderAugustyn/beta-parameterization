@@ -4,6 +4,7 @@ program beta_param_error_test
     use precision_utilities_mod, only: ik, rk
     use beta_parameterization_mod, only: cache_t, &
             compute_radius_grid_standalone_s, &
+            compute_radius_grid_standalone_with_com_shift_s, &
             LEGENDRE_VALID, LEGENDRE_ERROR_NORTH_POLE, LEGENDRE_ERROR_SOUTH_POLE, &
             LEGENDRE_ERROR_EMPTY_PARAMS, LEGENDRE_ERROR_INTERIOR_NEGATIVE, &
             LEGENDRE_ERROR_INVALID_MAX_PARAMS, LEGENDRE_ERROR_TOO_MANY_PARAMS, &
@@ -23,6 +24,8 @@ program beta_param_error_test
     call test_init_codes()
     call test_compute_codes()
     call test_com_not_converged_search()
+    call test_standalone_error_outputs_zeroed()
+    call test_standalone_empty_params_code_pinned()
     call test_summary()
 
 contains
@@ -96,5 +99,55 @@ contains
                 ' (0 hits is acceptable; code 7 remains covered by inspection)'
         call assert_true(.true., 'code 7: search executed and documented')
     end subroutine test_com_not_converged_search
+
+    !> F1 regression: standalone routines must zero their outputs on init
+    !! failure instead of leaving them undefined (v1 zeroed on every path;
+    !! the C wrappers copy these buffers out unconditionally). Sentinel fill
+    !! makes the pre-fix undefined-output state deterministically visible.
+    subroutine test_standalone_error_outputs_zeroed()
+        real(kind = rk)      :: radii(41), corrected
+        real(kind = rk)      :: params(2)
+        integer(kind = ik)   :: c, i
+        character(len = 256) :: msg
+        logical              :: all_zero
+
+        params = [0.1_rk, 0.2_rk]
+
+        radii(:) = -7.0_rk
+        call compute_radius_grid_standalone_s(params, 41_ik, radii, c, msg, &
+                max_beta_params = 0_ik)
+        call assert_int_eq(c, LEGENDRE_ERROR_INVALID_MAX_PARAMS, 'F1: standalone bad mbp fails')
+        all_zero = .true.
+        do i = 1_ik, 41_ik
+            if (abs(radii(i)) > 0.0_rk) all_zero = .false.
+        end do
+        call assert_true(all_zero, 'F1: standalone radii zeroed on init failure')
+
+        radii(:)  = -7.0_rk
+        corrected = -7.0_rk
+        call compute_radius_grid_standalone_with_com_shift_s(params, 41_ik, radii, &
+                corrected, c, msg, max_beta_params = 0_ik)
+        call assert_int_eq(c, LEGENDRE_ERROR_INVALID_MAX_PARAMS, 'F1: standalone-shift bad mbp fails')
+        all_zero = .true.
+        do i = 1_ik, 41_ik
+            if (abs(radii(i)) > 0.0_rk) all_zero = .false.
+        end do
+        call assert_true(all_zero, 'F1: standalone-shift radii zeroed on init failure')
+        call assert_true(abs(corrected) <= 0.0_rk, 'F1: corrected_beta10 zeroed on init failure')
+    end subroutine test_standalone_error_outputs_zeroed
+
+    !> Review-adjudicated (S-B REFUTED as defect): standalone with empty params
+    !! returns INVALID_MAX_PARAMS (5), not EMPTY_PARAMS (3) — the spec's
+    !! "max_beta_params defaults to size(params)" rule mandates this path.
+    !! Pinned so any future change is a conscious contract decision.
+    subroutine test_standalone_empty_params_code_pinned()
+        real(kind = rk)      :: empty(0), radii(41)
+        integer(kind = ik)   :: c
+        character(len = 256) :: msg
+
+        call compute_radius_grid_standalone_s(empty, 41_ik, radii, c, msg)
+        call assert_int_eq(c, LEGENDRE_ERROR_INVALID_MAX_PARAMS, &
+                'pin: standalone empty params -> INVALID_MAX_PARAMS (spec-mandated)')
+    end subroutine test_standalone_empty_params_code_pinned
 
 end program beta_param_error_test
