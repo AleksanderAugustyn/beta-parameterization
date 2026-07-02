@@ -134,6 +134,10 @@ target_link_libraries(golden_capture PRIVATE
 set_target_properties(golden_capture PROPERTIES
         Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/capture)
 
+add_executable(c_api_smoke_test tests/c_api_smoke_test.cpp)
+target_link_libraries(c_api_smoke_test PRIVATE beta_parameterization_cxx)
+add_test(NAME c_api_smoke COMMAND c_api_smoke_test)
+
 find_package(Threads REQUIRED)
 add_executable(thread_stress_test tests/thread_stress_test.cpp)
 target_link_libraries(thread_stress_test PRIVATE beta_parameterization_cxx Threads::Threads)
