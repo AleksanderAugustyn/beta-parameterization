@@ -17,6 +17,7 @@ program beta_param_node_set_test
     call test_radius_derivative_eval()
     call test_build_node_set()
     call test_resolve_shape()
+    call test_resolve_shape_no_com()
     call test_evaluate_uniform_parity()
     call test_evaluate_fd_golden()
     call test_evaluate_errors()
@@ -124,6 +125,44 @@ contains
         call cache%resolve_shape(params, bad_beta_con, corrected_beta10, r_north, r_south, code, message)
         call assert_int_eq(code, LEGENDRE_ERROR_INVALID_BUFFER_SIZE, 'resolve: beta_con size mismatch')
     end subroutine test_resolve_shape
+
+    !> apply_com_correction = .false. must reproduce compute_radius_grid (no
+    !! COM shift): same tables, same dot products, beta10 reported as the
+    !! input value instead of the COM-corrected one.
+    subroutine test_resolve_shape_no_com()
+        type(cache_t)        :: cache
+        type(node_set_t)     :: node_set
+        real(kind = rk)      :: params(4), beta_con(8), radii_ref(181)
+        real(kind = rk)      :: thetas(179), radii(179), dr(179)
+        real(kind = rk)      :: corrected_beta10, r_north, r_south
+        integer(kind = ik)   :: code, i
+        character(len = 256) :: message
+
+        call cache%init(8_ik, 181_ik, code, message)
+        params = [0.1_rk, 0.215_rk, 0.05_rk, 0.095_rk]  ! odd terms present but COM skipped
+
+        call cache%compute_radius_grid(params, radii_ref, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'no-com: reference grid valid')
+
+        do i = 1_ik, 179_ik
+            thetas(i) = real(i, rk) * PI_C / 180.0_rk
+        end do
+        call cache%build_node_set(thetas, node_set, code, message)
+
+        call cache%resolve_shape(params, beta_con, corrected_beta10, r_north, r_south, &
+                code, message, apply_com_correction = .false.)
+        call assert_int_eq(code, LEGENDRE_VALID, 'no-com: resolve valid')
+        call assert_close(corrected_beta10, params(1), 0.0_rk, 'no-com: beta10 passthrough')
+
+        call cache%compute_radius_and_derivative(beta_con, node_set, radii, dr, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'no-com: evaluate valid')
+
+        do i = 1_ik, 179_ik
+            call assert_close(radii(i), radii_ref(i + 1), 1.0e-15_rk, 'no-com: R matches compute_radius_grid')
+        end do
+        call assert_close(r_north, radii_ref(1), 1.0e-15_rk, 'no-com: r_north == R(0)')
+        call assert_close(r_south, radii_ref(181), 1.0e-15_rk, 'no-com: r_south == R(pi)')
+    end subroutine test_resolve_shape_no_com
 
     !> Node-set evaluation at the uniform grid's own thetas must reproduce
     !! compute_radius_grid_with_com_shift exactly (same beta_con, same tables,
