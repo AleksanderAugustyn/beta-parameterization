@@ -3,7 +3,8 @@
 program golden_capture
 
     use precision_utilities_mod, only: ik, rk
-    use beta_parameterization_mod, only: cache_t, LEGENDRE_VALID
+    use mathematical_and_physical_constants_mod, only: PI_C
+    use beta_parameterization_mod, only: cache_t, node_set_t, LEGENDRE_VALID
     use test_utils_mod, only: assert_int_eq, test_summary
 
     implicit none
@@ -49,6 +50,35 @@ contains
             write(*, '(A,A,A,ES24.16E3,A)') 'real(kind = rk), parameter :: ', name, &
                     '_CORRECTED_B10 = ', corrected, '_rk'
         end if
+
+        call capture_node_set(name, params)
     end subroutine capture
+
+    !> Node-set goldens: resolve + evaluate R and dR/dtheta at three fixed thetas.
+    !! Layout: [corrected_beta10, r_north, r_south, R(1:3), dR(1:3)].
+    subroutine capture_node_set(name, params)
+        character(len = *), intent(in) :: name
+        real(kind = rk),    intent(in) :: params(:)
+        type(node_set_t)     :: node_set
+        real(kind = rk)      :: thetas(3), beta_con(8), radii(3), dr(3)
+        real(kind = rk)      :: corrected_beta10, r_north, r_south, values(9)
+        integer(kind = ik)   :: c, i
+        character(len = 256) :: msg
+
+        thetas = [PI_C / 8.0_rk, PI_C / 2.0_rk, 7.0_rk * PI_C / 8.0_rk]
+        call cache%build_node_set(thetas, node_set, c, msg)
+        call assert_int_eq(c, LEGENDRE_VALID, name // ': node set built')
+        call cache%resolve_shape(params, beta_con, corrected_beta10, r_north, r_south, c, msg)
+        call assert_int_eq(c, LEGENDRE_VALID, name // ': resolved')
+        call cache%compute_radius_and_derivative(beta_con, node_set, radii, dr, c, msg)
+        call assert_int_eq(c, LEGENDRE_VALID, name // ': evaluated')
+
+        values = [corrected_beta10, r_north, r_south, radii, dr]
+        write(*, '(A,A,A)') 'real(kind = rk), parameter :: ', name, '_NODE_SET_EXPECTED(9) = [ &'
+        do i = 1_ik, 8_ik
+            write(*, '(A,ES24.16E3,A)') '        ', values(i), '_rk, &'
+        end do
+        write(*, '(A,ES24.16E3,A)') '        ', values(9), '_rk]'
+    end subroutine capture_node_set
 
 end program golden_capture

@@ -37,8 +37,10 @@ module beta_parameterization_mod
             compute_gauss_legendre_quadrature_s
     use beta_parameterization_workers_mod, only: &
             precompute_legendre_table_s, &
+            precompute_legendre_derivative_table_s, &
             eval_polar_radii_s, &
             eval_radius_grid_s, &
+            eval_radius_derivative_s, &
             find_min_radius_s, &
             iterate_com_correction_s
 
@@ -74,6 +76,7 @@ module beta_parameterization_mod
     integer(kind = ik), parameter, public :: LEGENDRE_ERROR_TOO_MANY_PARAMS     = 6_ik
     integer(kind = ik), parameter, public :: LEGENDRE_ERROR_COM_NOT_CONVERGED   = 7_ik
     integer(kind = ik), parameter, public :: LEGENDRE_ERROR_INVALID_BUFFER_SIZE = 8_ik
+    integer(kind = ik), parameter, public :: LEGENDRE_ERROR_POLE_NODE          = 9_ik
 
     !---------------------------------------------------------------------------
     ! Validation thresholds (policy — workers compute, API decides)
@@ -110,11 +113,34 @@ module beta_parameterization_mod
                               => cache_compute_radius_grid_s
         procedure, pass(self) :: compute_radius_grid_with_com_shift &
                               => cache_compute_radius_grid_with_com_shift_s
+        procedure, pass(self) :: build_node_set => cache_build_node_set_s
+        procedure, pass(self) :: resolve_shape  => cache_resolve_shape_s
+        procedure, pass(self) :: compute_radius_and_derivative &
+                              => cache_compute_radius_and_derivative_s
         procedure, pass(self) :: max_beta_params_get
         procedure, pass(self) :: n_grid_get
         procedure, pass(self) :: is_initialized_get
         final :: cache_final
     end type cache_t
+
+    !> A caller-owned set of theta nodes with precomputed Legendre P_k and P_k'
+    !! tables sized to one cache's max_beta_params. Built once (startup), then
+    !! reused across shapes. Carries no shape data; immutable after build and
+    !! safe to share across threads read-only. Deliberately generic: no
+    !! dense/folding/coulomb vocabulary — the caller owns what a set means.
+    type, public :: node_set_t
+        private
+        logical            :: is_built = .false.
+        integer(kind = ik) :: n_nodes  = 0_ik
+        real(kind = rk), allocatable :: thetas(:)
+        real(kind = rk), allocatable :: sin_thetas(:)
+        real(kind = rk), allocatable :: legendre_table(:, :)        ! P_k(cos theta_i)
+        real(kind = rk), allocatable :: legendre_deriv_table(:, :)  ! P_k'(cos theta_i)
+    contains
+        procedure, pass(self) :: is_built_get => node_set_is_built_get
+        procedure, pass(self) :: n_nodes_get  => node_set_n_nodes_get
+        procedure, pass(self) :: destroy      => node_set_destroy_s
+    end type node_set_t
 
 contains
 
@@ -233,6 +259,270 @@ contains
         logical :: b
         b = self%is_initialized
     end function
+
+    !===========================================================================
+    ! NODE SETS
+    !===========================================================================
+
+    pure function node_set_is_built_get(self) result(b)
+        class(node_set_t), intent(in) :: self
+        logical :: b
+        b = self%is_built
+    end function node_set_is_built_get
+
+    pure function node_set_n_nodes_get(self) result(n)
+        class(node_set_t), intent(in) :: self
+        integer(kind = ik) :: n
+        n = self%n_nodes
+    end function node_set_n_nodes_get
+
+    !> Deallocate all components and reset flags. Safe on an unbuilt set.
+    pure subroutine node_set_destroy_s(self)
+        class(node_set_t), intent(inout) :: self
+        if (allocated(self%thetas))               deallocate(self%thetas)
+        if (allocated(self%sin_thetas))           deallocate(self%sin_thetas)
+        if (allocated(self%legendre_table))       deallocate(self%legendre_table)
+        if (allocated(self%legendre_deriv_table)) deallocate(self%legendre_deriv_table)
+        self%is_built = .false.
+        self%n_nodes  = 0_ik
+    end subroutine node_set_destroy_s
+
+    !> Precompute P_k and P_k' tables at caller-supplied theta nodes.
+    !!
+    !! Pole nodes (1 - cos(theta)**2 == 0 in double precision) are rejected with
+    !! LEGENDRE_ERROR_POLE_NODE: the derivative recursion divides by 1 - x**2.
+    !! Gauss-Legendre nodes never land there; pole radii come analytically from
+    !! resolve_shape instead.
+    !!
+    !! @param[in]  thetas      Node angles (radians); any order, need not be uniform
+    !! @param[out] node_set    Filled tables (intent(out) resets any prior build)
+    !! @param[out] error_code  LEGENDRE_VALID on success
+    !! @param[out] message     Empty on success
+    subroutine cache_build_node_set_s(self, thetas, node_set, error_code, message)
+
+        class(cache_t),     intent(in)  :: self
+        real(kind = rk),    intent(in)  :: thetas(:)
+        type(node_set_t),   intent(out) :: node_set
+        integer(kind = ik), intent(out) :: error_code
+        character(len = *), intent(out) :: message
+
+        integer(kind = ik) :: n, i
+        real(kind = rk), allocatable :: x(:)
+
+        error_code = LEGENDRE_VALID
+        message    = ''
+
+        if (.not. self%is_initialized) then
+            error_code = LEGENDRE_ERROR_INVALID_MAX_PARAMS  ! reuse — API misuse, like cache_init_s
+            message    = 'build_node_set: cache not initialized'
+            return
+        end if
+
+        n = size(thetas, kind = ik)
+        if (n < 1_ik) then
+            error_code = LEGENDRE_ERROR_INVALID_BUFFER_SIZE
+            message    = 'build_node_set: thetas is empty'
+            return
+        end if
+
+        allocate(x(n))
+        x = cos(thetas)
+        do i = 1_ik, n
+            if (1.0_rk - x(i)**2 <= 0.0_rk) then
+                error_code = LEGENDRE_ERROR_POLE_NODE
+                write(message, '(A,ES12.4,A)') &
+                        'build_node_set: node at theta = ', thetas(i), &
+                        ' is a pole; use resolve_shape polar radii instead'
+                return
+            end if
+        end do
+
+        node_set%n_nodes = n
+        allocate(node_set%thetas(n), node_set%sin_thetas(n))
+        node_set%thetas     = thetas
+        node_set%sin_thetas = sin(thetas)
+        allocate(node_set%legendre_table(n, self%max_beta_params + 1_ik))
+        allocate(node_set%legendre_deriv_table(n, self%max_beta_params + 1_ik))
+        call precompute_legendre_table_s(x, self%max_beta_params, node_set%legendre_table)
+        call precompute_legendre_derivative_table_s(x, self%max_beta_params, &
+                node_set%legendre_table, node_set%legendre_deriv_table)
+        node_set%is_built = .true.
+
+    end subroutine cache_build_node_set_s
+
+    !> Resolve a shape once: pad + normalize params, run the COM iteration,
+    !! polar pre-check. Node-set-independent — feed the resulting beta_con to
+    !! compute_radius_and_derivative for any number of node sets.
+    !!
+    !! On any failure all outputs are zero-filled.
+    !!
+    !! @param[in]  params            Deformation parameters (beta10 is the COM dipole)
+    !! @param[out] beta_con          Normalized, COM-corrected coefficients;
+    !!                               size must equal cache max_beta_params
+    !! @param[out] corrected_beta10  Post-shift beta10
+    !! @param[out] r_north           Analytic R(0) from eval_polar_radii_s
+    !! @param[out] r_south           Analytic R(pi) from eval_polar_radii_s
+    !! @param[out] error_code        LEGENDRE_VALID on success
+    !! @param[out] message           Empty on success
+    subroutine cache_resolve_shape_s(self, params, beta_con, corrected_beta10, &
+            r_north, r_south, error_code, message)
+
+        class(cache_t),     intent(in)  :: self
+        real(kind = rk),    intent(in)  :: params(:)
+        real(kind = rk),    intent(out) :: beta_con(:)
+        real(kind = rk),    intent(out) :: corrected_beta10
+        real(kind = rk),    intent(out) :: r_north
+        real(kind = rk),    intent(out) :: r_south
+        integer(kind = ik), intent(out) :: error_code
+        character(len = *), intent(out) :: message
+
+        real(kind = rk)    :: beta_local(self%max_beta_params)
+        integer(kind = ik) :: n_params, n_iter
+        logical            :: converged
+
+        error_code       = LEGENDRE_VALID
+        message          = ''
+        beta_con(:)      = 0.0_rk
+        corrected_beta10 = 0.0_rk
+        r_north          = 0.0_rk
+        r_south          = 0.0_rk
+
+        n_params = size(params, kind = ik)
+        if (n_params < 1_ik) then
+            error_code = LEGENDRE_ERROR_EMPTY_PARAMS
+            message    = 'params is empty'
+            return
+        end if
+        if (n_params > self%max_beta_params) then
+            error_code = LEGENDRE_ERROR_TOO_MANY_PARAMS
+            write(message, '(A,I0,A,I0)') &
+                    'params has ', n_params, &
+                    ' entries but cache built for max_beta_params = ', self%max_beta_params
+            return
+        end if
+        if (size(beta_con, kind = ik) /= self%max_beta_params) then
+            error_code = LEGENDRE_ERROR_INVALID_BUFFER_SIZE
+            write(message, '(A,I0,A,I0)') &
+                    'beta_con buffer size ', size(beta_con), &
+                    ' does not match cache max_beta_params ', self%max_beta_params
+            return
+        end if
+
+        beta_local(:)          = 0.0_rk
+        beta_local(1:n_params) = params(1:n_params)
+        beta_con(:)            = beta_local(:) * self%norm_constants(:)
+
+        call iterate_com_correction_s( &
+                beta_local, beta_con, self%norm_constants, &
+                self%gl_nodes, self%gl_weights, self%legendre_gl, &
+                converged, n_iter)
+
+        corrected_beta10 = beta_local(1)
+
+        if (.not. converged) then
+            error_code = LEGENDRE_ERROR_COM_NOT_CONVERGED
+            write(message, '(A,I0,A)') &
+                    'COM correction failed to converge after ', n_iter, ' iterations'
+            beta_con(:)      = 0.0_rk
+            corrected_beta10 = 0.0_rk
+            return
+        end if
+
+        call eval_polar_radii_s(beta_con, r_north, r_south)
+        if (r_north <= R_MIN_THRESHOLD) then
+            error_code = LEGENDRE_ERROR_NORTH_POLE
+            write(message, '(A,ES12.4)') 'North pole radius not positive: R(0) = ', r_north
+            beta_con(:)      = 0.0_rk
+            corrected_beta10 = 0.0_rk
+            r_north          = 0.0_rk
+            r_south          = 0.0_rk
+            return
+        end if
+        if (r_south <= R_MIN_THRESHOLD) then
+            error_code = LEGENDRE_ERROR_SOUTH_POLE
+            write(message, '(A,ES12.4)') 'South pole radius not positive: R(pi) = ', r_south
+            beta_con(:)      = 0.0_rk
+            corrected_beta10 = 0.0_rk
+            r_north          = 0.0_rk
+            r_south          = 0.0_rk
+            return
+        end if
+
+    end subroutine cache_resolve_shape_s
+
+    !> Evaluate R and dR/dtheta at a node set, for a shape already resolved by
+    !! resolve_shape. Dot products only — no iteration, no allocation.
+    !!
+    !! Defense-in-depth: the interior-positivity scan always reports
+    !! LEGENDRE_ERROR_INTERIOR_NEGATIVE (node sets exclude the poles, so the
+    !! uniform-grid pole-index mapping does not apply). Zero-fills on failure.
+    !!
+    !! @param[in]  beta_con    Resolved coefficients from resolve_shape;
+    !!                         size must equal cache max_beta_params
+    !! @param[in]  node_set    Built by this cache's build_node_set
+    !! @param[out] radii       R(theta_i); size must equal node set n_nodes
+    !! @param[out] dr_dthetas  dR/dtheta(theta_i); size must equal node set n_nodes
+    !! @param[out] error_code  LEGENDRE_VALID on success
+    !! @param[out] message     Empty on success
+    subroutine cache_compute_radius_and_derivative_s(self, beta_con, node_set, &
+            radii, dr_dthetas, error_code, message)
+
+        class(cache_t),     intent(in)  :: self
+        real(kind = rk),    intent(in)  :: beta_con(:)
+        type(node_set_t),   intent(in)  :: node_set
+        real(kind = rk),    intent(out) :: radii(:)
+        real(kind = rk),    intent(out) :: dr_dthetas(:)
+        integer(kind = ik), intent(out) :: error_code
+        character(len = *), intent(out) :: message
+
+        real(kind = rk)    :: r_min
+        integer(kind = ik) :: i_min
+
+        error_code    = LEGENDRE_VALID
+        message       = ''
+        radii(:)      = 0.0_rk
+        dr_dthetas(:) = 0.0_rk
+
+        if (.not. node_set%is_built) then
+            error_code = LEGENDRE_ERROR_INVALID_BUFFER_SIZE
+            message    = 'compute_radius_and_derivative: node set not built'
+            return
+        end if
+        if (size(node_set%legendre_table, 2, kind = ik) /= self%max_beta_params + 1_ik) then
+            error_code = LEGENDRE_ERROR_INVALID_BUFFER_SIZE
+            message    = 'compute_radius_and_derivative: node set built by a different cache'
+            return
+        end if
+        if (size(beta_con, kind = ik) /= self%max_beta_params) then
+            error_code = LEGENDRE_ERROR_INVALID_BUFFER_SIZE
+            write(message, '(A,I0,A,I0)') &
+                    'beta_con size ', size(beta_con), &
+                    ' does not match cache max_beta_params ', self%max_beta_params
+            return
+        end if
+        if (size(radii, kind = ik) /= node_set%n_nodes .or. &
+                size(dr_dthetas, kind = ik) /= node_set%n_nodes) then
+            error_code = LEGENDRE_ERROR_INVALID_BUFFER_SIZE
+            write(message, '(A,I0)') &
+                    'radii/dr_dthetas buffers must match node set n_nodes = ', node_set%n_nodes
+            return
+        end if
+
+        call eval_radius_grid_s(beta_con, node_set%legendre_table, radii)
+        call eval_radius_derivative_s(beta_con, node_set%legendre_deriv_table, &
+                node_set%sin_thetas, dr_dthetas)
+
+        call find_min_radius_s(radii, r_min, i_min)
+        if (r_min <= R_MIN_THRESHOLD) then
+            error_code = LEGENDRE_ERROR_INTERIOR_NEGATIVE
+            write(message, '(A,F8.4,A,ES12.4)') &
+                    'Radius not positive at theta = ', node_set%thetas(i_min), ', R = ', r_min
+            radii(:)      = 0.0_rk
+            dr_dthetas(:) = 0.0_rk
+            return
+        end if
+
+    end subroutine cache_compute_radius_and_derivative_s
 
     !===========================================================================
     ! HOT PATH
@@ -356,11 +646,9 @@ contains
         integer(kind = ik), intent(out) :: error_code
         character(len = *), intent(out) :: message
 
-        real(kind = rk) :: beta_local(self%max_beta_params)
         real(kind = rk) :: beta_con(self%max_beta_params)
         real(kind = rk) :: r_north, r_south, r_min, h, theta
-        integer(kind = ik) :: n_params, i_min, n_iter
-        logical :: converged
+        integer(kind = ik) :: n_params, i_min
 
         error_code       = LEGENDRE_VALID
         message          = ''
@@ -391,38 +679,12 @@ contains
             return
         end if
 
-        ! Step 3: pad and form beta_con
-        beta_local(:)          = 0.0_rk
-        beta_local(1:n_params) = params(1:n_params)
-        beta_con(:)            = beta_local(:) * self%norm_constants(:)
-
-        ! Step 4: COM iteration (modifies beta_local(1) and beta_con(1))
-        call iterate_com_correction_s( &
-                beta_local, beta_con, self%norm_constants, &
-                self%gl_nodes, self%gl_weights, self%legendre_gl, &
-                converged, n_iter)
-
-        corrected_beta10 = beta_local(1)
-
-        if (.not. converged) then
-            error_code = LEGENDRE_ERROR_COM_NOT_CONVERGED
-            write(message, '(A,I0,A)') &
-                    'COM correction failed to converge after ', n_iter, ' iterations'
-            return
-        end if
-
-        ! Step 5: polar pre-check (post-COM)
-        call eval_polar_radii_s(beta_con, r_north, r_south)
-        if (r_north <= R_MIN_THRESHOLD) then
-            error_code = LEGENDRE_ERROR_NORTH_POLE
-            write(message, '(A,ES12.4)') 'North pole radius not positive: R(0) = ', r_north
-            return
-        end if
-        if (r_south <= R_MIN_THRESHOLD) then
-            error_code = LEGENDRE_ERROR_SOUTH_POLE
-            write(message, '(A,ES12.4)') 'South pole radius not positive: R(pi) = ', r_south
-            return
-        end if
+        ! Steps 3-5 (normalization, COM iteration, polar pre-check) live in
+        ! resolve_shape; error codes and messages unchanged. Steps 1-2 above
+        ! stay inline so error precedence is untouched.
+        call self%resolve_shape(params, beta_con, corrected_beta10, r_north, r_south, &
+                error_code, message)
+        if (error_code /= LEGENDRE_VALID) return
 
         ! Step 6: grid evaluation
         call eval_radius_grid_s(beta_con, self%legendre_theta_grid, radii)

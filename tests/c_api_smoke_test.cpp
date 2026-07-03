@@ -118,6 +118,75 @@ int main() {
     check(status == beta_param::Status::Valid, "hpp: com-shift Valid");
     check(std::fabs(corrected - 0.30) > 1e-6, "hpp: corrected beta10 moved");
 
+    // --- Node-set API (C) ---
+    {
+        std::array<char, 256> nbuf{};
+        const double thetas[3] = {0.4, 1.5707963267948966, 2.7};
+        beta_param_cache_t* ns_cache =
+                beta_param_cache_create(8, 181, static_cast<int>(nbuf.size()), nbuf.data());
+        check(ns_cache != nullptr, "C: node-set cache create");
+
+        beta_param_node_set_t* nodes = beta_param_node_set_create(
+                ns_cache, thetas, 3, static_cast<int>(nbuf.size()), nbuf.data());
+        check(nodes != nullptr, "C: node_set_create succeeds");
+
+        const double ns_params[4] = {0.1, 0.2, 0.05, 0.1};
+        double beta_con[8];
+        double corrected_beta10 = -1.0, r_north = -1.0, r_south = -1.0;
+        int st = beta_param_cache_resolve_shape(
+                ns_cache, ns_params, 4, beta_con, &corrected_beta10, &r_north, &r_south,
+                static_cast<int>(nbuf.size()), nbuf.data());
+        check(st == BETA_PARAM_VALID, "C: resolve_shape VALID");
+        check(r_north > 0.0 && r_south > 0.0, "C: resolve_shape pole radii positive");
+
+        double ns_radii[3], ns_dr[3];
+        st = beta_param_cache_compute_radius_and_derivative(
+                ns_cache, nodes, beta_con, 8, ns_radii, ns_dr, 3,
+                static_cast<int>(nbuf.size()), nbuf.data());
+        check(st == BETA_PARAM_VALID, "C: radius_and_derivative VALID");
+        for (int i = 0; i < 3; ++i) check(ns_radii[i] > 0.0, "C: node-set radius positive");
+
+        // Pole node must be rejected with the new code (NULL handle, message set)
+        const double pole_theta[1] = {0.0};
+        beta_param_node_set_t* bad = beta_param_node_set_create(
+                ns_cache, pole_theta, 1, static_cast<int>(nbuf.size()), nbuf.data());
+        check(bad == nullptr, "C: pole node rejected with NULL handle");
+        check(nbuf[0] != '\0', "C: pole rejection message non-empty");
+
+        beta_param_node_set_destroy(nodes);
+        beta_param_node_set_destroy(nullptr);  // null-safe by contract
+        beta_param_cache_destroy(ns_cache);
+    }
+
+    // --- Node-set API (C++ wrapper) ---
+    {
+        beta_param::Cache c8(8, 181);
+        const std::array<double, 3> thetas{0.4, 1.5707963267948966, 2.7};
+        beta_param::NodeSet nodes(c8, thetas);
+        check(nodes.n_nodes() == 3, "hpp: NodeSet n_nodes");
+
+        const std::vector<double> ns_params{0.1, 0.2, 0.05, 0.1};
+        std::vector<double> beta_con(8);
+        double corrected_beta10 = 0.0, r_north = 0.0, r_south = 0.0;
+        std::string msg;
+        auto st = c8.resolve_shape(ns_params, beta_con, corrected_beta10, r_north, r_south, msg);
+        check(st == beta_param::Status::Valid, "hpp: resolve_shape Valid");
+
+        std::vector<double> r(3), dr(3);
+        st = c8.compute_radius_and_derivative(beta_con, nodes, r, dr, msg);
+        check(st == beta_param::Status::Valid, "hpp: radius_and_derivative Valid");
+        check(r[0] > 0.0 && r[1] > 0.0 && r[2] > 0.0, "hpp: node radii positive");
+
+        bool pole_threw = false;
+        try {
+            const std::array<double, 1> pole{0.0};
+            beta_param::NodeSet bad(c8, pole);
+        } catch (const std::runtime_error&) {
+            pole_threw = true;
+        }
+        check(pole_threw, "hpp: NodeSet constructor throws on pole node");
+    }
+
     std::printf("c_api_smoke_test: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

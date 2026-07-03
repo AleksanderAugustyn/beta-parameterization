@@ -16,8 +16,10 @@ module beta_parameterization_workers_mod
 
     ! Procedures (uncommented as each is added in Tasks 2–4)
     public :: precompute_legendre_table_s
+    public :: precompute_legendre_derivative_table_s
     public :: eval_polar_radii_s
     public :: eval_radius_grid_s
+    public :: eval_radius_derivative_s
     public :: find_min_radius_s
     public :: compute_com_integrals_s
     public :: iterate_com_correction_s
@@ -51,6 +53,38 @@ contains
         end do
 
     end subroutine precompute_legendre_table_s
+
+    !> Fill `deriv_table(i, k+1) = P_k'(x_values(i))` for k = 0..max_lambda.
+    !!
+    !! Uses (1-x**2) * P_k'(x) = k * (P_{k-1}(x) - x * P_k(x)). Caller guarantees
+    !! |x| < 1: Gauss-Legendre nodes never land on the poles, and build_node_set
+    !! rejects pole nodes before calling this.
+    !!
+    !! @param[in]  x_values        Evaluation points, |x| < 1
+    !! @param[in]  max_lambda      Highest Legendre order
+    !! @param[in]  legendre_table  Precomputed P_k table (from precompute_legendre_table_s)
+    !! @param[out] deriv_table     Column k+1 holds P_k'. Shape (size(x_values), max_lambda + 1)
+    pure subroutine precompute_legendre_derivative_table_s(x_values, max_lambda, &
+            legendre_table, deriv_table)
+
+        real(kind = rk),    intent(in)  :: x_values(:)
+        integer(kind = ik), intent(in)  :: max_lambda
+        real(kind = rk),    intent(in)  :: legendre_table(:, :)
+        real(kind = rk),    intent(out) :: deriv_table(:, :)
+
+        integer(kind = ik) :: i, k
+        real(kind = rk)    :: one_minus_x_sq_inv
+
+        do i = 1_ik, size(x_values, kind = ik)
+            one_minus_x_sq_inv = 1.0_rk / (1.0_rk - x_values(i)**2)
+            deriv_table(i, 1) = 0.0_rk
+            do k = 1_ik, max_lambda
+                deriv_table(i, k + 1) = real(k, rk) * one_minus_x_sq_inv &
+                        * (legendre_table(i, k) - x_values(i) * legendre_table(i, k + 1))
+            end do
+        end do
+
+    end subroutine precompute_legendre_derivative_table_s
 
     !> Compute R(0) and R(π) analytically from beta×normalization products.
     !!
@@ -110,6 +144,36 @@ contains
         end do
 
     end subroutine eval_radius_grid_s
+
+    !> dr_dthetas(i) = -sin(theta_i) * sum_k beta_con(k) * P_k'(cos theta_i).
+    !!
+    !! Chain rule on R(theta) = 1 + sum_k beta_con(k) * P_k(cos theta):
+    !! d/dtheta = -sin(theta) * d/dx.
+    !!
+    !! @param[in]  beta_con              beta x norm products (size = max_beta_params)
+    !! @param[in]  legendre_deriv_table  P_k' table. Shape (n_nodes, max_beta_params + 1)
+    !! @param[in]  sin_thetas            sin(theta_i) per node (size = n_nodes)
+    !! @param[out] dr_dthetas            dR/dtheta values (size = n_nodes)
+    pure subroutine eval_radius_derivative_s(beta_con, legendre_deriv_table, &
+            sin_thetas, dr_dthetas)
+
+        real(kind = rk), intent(in)  :: beta_con(:)
+        real(kind = rk), intent(in)  :: legendre_deriv_table(:, :)
+        real(kind = rk), intent(in)  :: sin_thetas(:)
+        real(kind = rk), intent(out) :: dr_dthetas(:)
+
+        integer(kind = ik) :: i, k
+        real(kind = rk)    :: acc
+
+        do i = 1_ik, size(dr_dthetas, kind = ik)
+            acc = 0.0_rk
+            do k = 1_ik, size(beta_con, kind = ik)
+                acc = acc + beta_con(k) * legendre_deriv_table(i, k + 1_ik)
+            end do
+            dr_dthetas(i) = -sin_thetas(i) * acc
+        end do
+
+    end subroutine eval_radius_derivative_s
 
     !> Return the minimum radius and its grid index.
     !!

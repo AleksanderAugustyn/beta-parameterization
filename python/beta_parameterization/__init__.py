@@ -4,7 +4,10 @@ from ._libloader import load_library
 from .api import (
     BetaParamError,
     Cache,
+    NodeSet,
+    RadiusDerivativeResult,
     RadiusGridResult,
+    ResolvedShape,
     Status,
     radius_grid_standalone,
     radius_grid_standalone_with_com_shift,
@@ -12,7 +15,8 @@ from .api import (
 )
 
 __all__ = [
-    "BetaParamError", "Cache", "RadiusGridResult", "Status",
+    "BetaParamError", "Cache", "NodeSet", "RadiusDerivativeResult",
+    "RadiusGridResult", "ResolvedShape", "Status",
     "radius_grid_standalone", "radius_grid_standalone_with_com_shift",
     "theta_grid", "load_library",
     "MAX_BETA_PARAMS_LIMIT", "MESSAGE_BUFFER_SIZE",

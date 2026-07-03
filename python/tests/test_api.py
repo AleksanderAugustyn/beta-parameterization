@@ -101,3 +101,44 @@ def test_use_after_close_raises() -> None:
     cache.close()
     with pytest.raises(bp.BetaParamError):
         cache.radius_grid([0.0, 0.2])
+
+
+def test_node_set_resolve_evaluate_fd_parity() -> None:
+    thetas = np.linspace(0.2, np.pi - 0.2, 50)
+    h = 1e-3
+    stencil = np.concatenate([thetas - 2 * h, thetas - h, thetas + h, thetas + 2 * h])
+    params = [0.15, 0.25, 0.1, 0.05, 0.02]
+
+    with bp.Cache(8, 181) as cache:
+        resolved = cache.resolve_shape(params)
+        assert resolved.ok
+        assert resolved.r_north > 0.0 and resolved.r_south > 0.0
+
+        with cache.build_node_set(thetas) as nodes, cache.build_node_set(stencil) as st:
+            result = cache.radius_and_derivative(resolved.beta_con, nodes)
+            assert result.ok
+            sr = cache.radius_and_derivative(resolved.beta_con, st).radii
+            n = thetas.size
+            fd = (sr[:n] - 8 * sr[n:2 * n] + 8 * sr[2 * n:3 * n] - sr[3 * n:]) / (12 * h)
+            np.testing.assert_allclose(result.dr_dtheta, fd, rtol=0.0, atol=1e-9)
+
+
+def test_node_set_matches_uniform_grid() -> None:
+    n_grid = 181
+    params = [0.1, 0.2, 0.05, 0.1]
+    interior = bp.theta_grid(n_grid)[1:-1]
+
+    with bp.Cache(8, n_grid) as cache:
+        ref = cache.radius_grid_with_com_shift(params)
+        assert ref.ok
+        resolved = cache.resolve_shape(params)
+        assert resolved.corrected_beta10 == pytest.approx(ref.corrected_beta10, abs=1e-15)
+        with cache.build_node_set(interior) as nodes:
+            result = cache.radius_and_derivative(resolved.beta_con, nodes)
+            np.testing.assert_allclose(result.radii, ref.radii[1:-1], rtol=0.0, atol=1e-15)
+
+
+def test_node_set_pole_rejected() -> None:
+    with bp.Cache(8, 181) as cache:
+        with pytest.raises(bp.BetaParamError, match="pole"):
+            cache.build_node_set(np.array([0.0, 1.0]))
