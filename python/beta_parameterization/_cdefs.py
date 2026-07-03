@@ -37,4 +37,23 @@ def configure(lib: ctypes.CDLL) -> ctypes.CDLL:
         c_dbl_p, ctypes.c_int, ctypes.c_int, c_dbl_p, c_dbl_p,
         ctypes.c_int, ctypes.c_char_p]
     lib.beta_param_compute_radius_grid_standalone_with_com_shift.restype = ctypes.c_int
+
+    lib.beta_param_node_set_create.argtypes = [
+        ctypes.c_void_p, c_dbl_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
+    lib.beta_param_node_set_create.restype = ctypes.c_void_p
+
+    lib.beta_param_node_set_destroy.argtypes = [ctypes.c_void_p]
+    lib.beta_param_node_set_destroy.restype = None
+
+    lib.beta_param_cache_resolve_shape.argtypes = [
+        ctypes.c_void_p, c_dbl_p, ctypes.c_int,
+        c_dbl_p, c_dbl_p, c_dbl_p, c_dbl_p,
+        ctypes.c_int, ctypes.c_char_p]
+    lib.beta_param_cache_resolve_shape.restype = ctypes.c_int
+
+    lib.beta_param_cache_compute_radius_and_derivative.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, c_dbl_p, ctypes.c_int,
+        c_dbl_p, c_dbl_p, ctypes.c_int,
+        ctypes.c_int, ctypes.c_char_p]
+    lib.beta_param_cache_compute_radius_and_derivative.restype = ctypes.c_int
     return lib

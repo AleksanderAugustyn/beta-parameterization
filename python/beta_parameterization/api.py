@@ -37,6 +37,7 @@ class Status(IntEnum):
     ERROR_TOO_MANY_PARAMS = 6
     ERROR_COM_NOT_CONVERGED = 7
     ERROR_INVALID_BUFFER_SIZE = 8
+    POLE_NODE = 9
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,61 @@ class RadiusGridResult:
     @property
     def ok(self) -> bool:
         return self.status == Status.VALID
+
+
+@dataclass(frozen=True)
+class ResolvedShape:
+    """One resolve_shape call: COM-corrected coefficients plus analytic pole radii."""
+    beta_con: npt.NDArray[np.float64]
+    corrected_beta10: float
+    r_north: float
+    r_south: float
+    status: Status
+    message: str
+
+    @property
+    def ok(self) -> bool:
+        return self.status == Status.VALID
+
+
+@dataclass(frozen=True)
+class RadiusDerivativeResult:
+    """One radius_and_derivative call: R and dR/dθ at a node set's thetas."""
+    radii: npt.NDArray[np.float64]
+    dr_dtheta: npt.NDArray[np.float64]
+    status: Status
+    message: str
+
+    @property
+    def ok(self) -> bool:
+        return self.status == Status.VALID
+
+
+class NodeSet:
+    """Precomputed Legendre tables at fixed thetas. Create via Cache.build_node_set."""
+
+    def __init__(self, handle: ctypes.c_void_p, n_nodes: int) -> None:
+        self._handle: Optional[ctypes.c_void_p] = handle
+        self.n_nodes = n_nodes
+
+    def close(self) -> None:
+        if getattr(self, "_handle", None) is not None:
+            _get_lib().beta_param_node_set_destroy(self._handle)
+            self._handle = None
+
+    def __enter__(self) -> "NodeSet":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+    def _require_handle(self) -> ctypes.c_void_p:
+        if self._handle is None:
+            raise BetaParamError("NodeSet is closed")
+        return self._handle
 
 
 def theta_grid(n_grid: int) -> npt.NDArray[np.float64]:
@@ -134,6 +190,69 @@ class Cache:
             radii=radii, status=Status(status),
             message=buf.value.decode(errors="replace"),
             corrected_beta10=corrected.value)
+
+    def build_node_set(self, thetas: npt.ArrayLike) -> NodeSet:
+        """Precompute P_k and P_k' tables at the given thetas (radians).
+
+        Raises BetaParamError on failure — including any pole node
+        (Status.POLE_NODE); pole radii come from resolve_shape instead.
+        """
+        handle = self._require_handle()
+        arr = np.ascontiguousarray(thetas, dtype=np.float64)
+        if arr.ndim != 1:
+            raise ValueError(f"thetas must be 1-D, got shape {arr.shape}")
+        buf = ctypes.create_string_buffer(MESSAGE_BUFFER_SIZE)
+        ns_handle = _get_lib().beta_param_node_set_create(
+            handle,
+            arr.ctypes.data_as(c_dbl_p), arr.size,
+            MESSAGE_BUFFER_SIZE, buf)
+        if not ns_handle:
+            raise BetaParamError(
+                f"NodeSet build failed: {buf.value.decode(errors='replace')}")
+        return NodeSet(ctypes.c_void_p(ns_handle), int(arr.size))
+
+    def resolve_shape(self, params: npt.ArrayLike) -> ResolvedShape:
+        """Resolve a shape once (COM iteration + polar pre-check).
+
+        Node-set-independent: feed the returned beta_con to
+        radius_and_derivative for any number of node sets.
+        """
+        handle = self._require_handle()
+        arr = _as_params(params)
+        beta_con = np.zeros(self.max_beta_params, dtype=np.float64)
+        corrected = ctypes.c_double(0.0)
+        r_north = ctypes.c_double(0.0)
+        r_south = ctypes.c_double(0.0)
+        buf = ctypes.create_string_buffer(MESSAGE_BUFFER_SIZE)
+        status = _get_lib().beta_param_cache_resolve_shape(
+            handle,
+            arr.ctypes.data_as(c_dbl_p), arr.size,
+            beta_con.ctypes.data_as(c_dbl_p),
+            ctypes.byref(corrected), ctypes.byref(r_north), ctypes.byref(r_south),
+            MESSAGE_BUFFER_SIZE, buf)
+        return ResolvedShape(
+            beta_con=beta_con, corrected_beta10=corrected.value,
+            r_north=r_north.value, r_south=r_south.value,
+            status=Status(status), message=buf.value.decode(errors="replace"))
+
+    def radius_and_derivative(
+            self, beta_con: npt.ArrayLike, node_set: NodeSet) -> RadiusDerivativeResult:
+        """R and dR/dθ at a node set, for a shape resolved by resolve_shape."""
+        handle = self._require_handle()
+        ns_handle = node_set._require_handle()
+        arr = np.ascontiguousarray(beta_con, dtype=np.float64)
+        radii = np.zeros(node_set.n_nodes, dtype=np.float64)
+        dr_dtheta = np.zeros(node_set.n_nodes, dtype=np.float64)
+        buf = ctypes.create_string_buffer(MESSAGE_BUFFER_SIZE)
+        status = _get_lib().beta_param_cache_compute_radius_and_derivative(
+            handle, ns_handle,
+            arr.ctypes.data_as(c_dbl_p), arr.size,
+            radii.ctypes.data_as(c_dbl_p), dr_dtheta.ctypes.data_as(c_dbl_p),
+            node_set.n_nodes,
+            MESSAGE_BUFFER_SIZE, buf)
+        return RadiusDerivativeResult(
+            radii=radii, dr_dtheta=dr_dtheta,
+            status=Status(status), message=buf.value.decode(errors="replace"))
 
 
 def radius_grid_standalone(params: npt.ArrayLike, n_grid: int) -> RadiusGridResult:
