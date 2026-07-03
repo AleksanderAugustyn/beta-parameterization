@@ -16,6 +16,7 @@ module beta_parameterization_workers_mod
 
     ! Procedures (uncommented as each is added in Tasks 2–4)
     public :: precompute_legendre_table_s
+    public :: precompute_legendre_derivative_table_s
     public :: eval_polar_radii_s
     public :: eval_radius_grid_s
     public :: find_min_radius_s
@@ -51,6 +52,38 @@ contains
         end do
 
     end subroutine precompute_legendre_table_s
+
+    !> Fill `deriv_table(i, k+1) = P_k'(x_values(i))` for k = 0..max_lambda.
+    !!
+    !! Uses (1-x**2) * P_k'(x) = k * (P_{k-1}(x) - x * P_k(x)). Caller guarantees
+    !! |x| < 1: Gauss-Legendre nodes never land on the poles, and build_node_set
+    !! rejects pole nodes before calling this.
+    !!
+    !! @param[in]  x_values        Evaluation points, |x| < 1
+    !! @param[in]  max_lambda      Highest Legendre order
+    !! @param[in]  legendre_table  Precomputed P_k table (from precompute_legendre_table_s)
+    !! @param[out] deriv_table     Column k+1 holds P_k'. Shape (size(x_values), max_lambda + 1)
+    pure subroutine precompute_legendre_derivative_table_s(x_values, max_lambda, &
+            legendre_table, deriv_table)
+
+        real(kind = rk),    intent(in)  :: x_values(:)
+        integer(kind = ik), intent(in)  :: max_lambda
+        real(kind = rk),    intent(in)  :: legendre_table(:, :)
+        real(kind = rk),    intent(out) :: deriv_table(:, :)
+
+        integer(kind = ik) :: i, k
+        real(kind = rk)    :: one_minus_x_sq_inv
+
+        do i = 1_ik, size(x_values, kind = ik)
+            one_minus_x_sq_inv = 1.0_rk / (1.0_rk - x_values(i)**2)
+            deriv_table(i, 1) = 0.0_rk
+            do k = 1_ik, max_lambda
+                deriv_table(i, k + 1) = real(k, rk) * one_minus_x_sq_inv &
+                        * (legendre_table(i, k) - x_values(i) * legendre_table(i, k + 1))
+            end do
+        end do
+
+    end subroutine precompute_legendre_derivative_table_s
 
     !> Compute R(0) and R(π) analytically from beta×normalization products.
     !!
