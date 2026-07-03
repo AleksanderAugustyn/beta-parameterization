@@ -364,8 +364,12 @@ contains
     !! @param[out] r_south           Analytic R(pi) from eval_polar_radii_s
     !! @param[out] error_code        LEGENDRE_VALID on success
     !! @param[out] message           Empty on success
+    !! @param[in]  apply_com_correction  Optional (default .true.); .false.
+    !!                               skips the COM iteration (corrected_beta10
+    !!                               = input beta10), matching
+    !!                               compute_radius_grid's no-COM semantics.
     subroutine cache_resolve_shape_s(self, params, beta_con, corrected_beta10, &
-            r_north, r_south, error_code, message)
+            r_north, r_south, error_code, message, apply_com_correction)
 
         class(cache_t),     intent(in)  :: self
         real(kind = rk),    intent(in)  :: params(:)
@@ -375,10 +379,11 @@ contains
         real(kind = rk),    intent(out) :: r_south
         integer(kind = ik), intent(out) :: error_code
         character(len = *), intent(out) :: message
+        logical,            intent(in), optional :: apply_com_correction
 
         real(kind = rk)    :: beta_local(self%max_beta_params)
         integer(kind = ik) :: n_params, n_iter
-        logical            :: converged
+        logical            :: converged, do_com
 
         error_code       = LEGENDRE_VALID
         message          = ''
@@ -412,20 +417,27 @@ contains
         beta_local(1:n_params) = params(1:n_params)
         beta_con(:)            = beta_local(:) * self%norm_constants(:)
 
-        call iterate_com_correction_s( &
-                beta_local, beta_con, self%norm_constants, &
-                self%gl_nodes, self%gl_weights, self%legendre_gl, &
-                converged, n_iter)
+        do_com = .true.
+        if (present(apply_com_correction)) do_com = apply_com_correction
 
-        corrected_beta10 = beta_local(1)
+        if (do_com) then
+            call iterate_com_correction_s( &
+                    beta_local, beta_con, self%norm_constants, &
+                    self%gl_nodes, self%gl_weights, self%legendre_gl, &
+                    converged, n_iter)
 
-        if (.not. converged) then
-            error_code = LEGENDRE_ERROR_COM_NOT_CONVERGED
-            write(message, '(A,I0,A)') &
-                    'COM correction failed to converge after ', n_iter, ' iterations'
-            beta_con(:)      = 0.0_rk
-            corrected_beta10 = 0.0_rk
-            return
+            corrected_beta10 = beta_local(1)
+
+            if (.not. converged) then
+                error_code = LEGENDRE_ERROR_COM_NOT_CONVERGED
+                write(message, '(A,I0,A)') &
+                        'COM correction failed to converge after ', n_iter, ' iterations'
+                beta_con(:)      = 0.0_rk
+                corrected_beta10 = 0.0_rk
+                return
+            end if
+        else
+            corrected_beta10 = beta_local(1)
         end if
 
         call eval_polar_radii_s(beta_con, r_north, r_south)
