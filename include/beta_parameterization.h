@@ -49,9 +49,13 @@ extern "C" {
 #define BETA_PARAM_ERROR_TOO_MANY_PARAMS     6
 #define BETA_PARAM_ERROR_COM_NOT_CONVERGED   7
 #define BETA_PARAM_ERROR_INVALID_BUFFER_SIZE 8
+#define BETA_PARAM_ERROR_POLE_NODE           9
 
 /* --- Opaque cache handle --- */
 typedef struct beta_param_cache beta_param_cache_t;
+
+/* --- Opaque node-set handle (precomputed Legendre tables at fixed thetas) --- */
+typedef struct beta_param_node_set beta_param_node_set_t;
 
 /* --- Cache lifecycle --- */
 
@@ -97,6 +101,76 @@ int beta_param_cache_compute_radius_grid_with_com_shift(
         const beta_param_cache_t* cache,
         const double* params, int n_params,
         double* radii, double* corrected_beta10,
+        int message_buf_len, char* message_buf);
+
+/* --- Node-set API (arbitrary thetas, R + analytic dR/dtheta) --- */
+
+/**
+ * Build a node set: precomputed Legendre P_k and P_k' tables at the given
+ * thetas, sized to the cache's max_beta_params. Returns NULL on failure
+ * (reason in message_buf) — including any pole node (theta where
+ * cos(theta)^2 == 1 in double precision), which is rejected with
+ * BETA_PARAM_ERROR_POLE_NODE; use the resolve_shape polar radii instead.
+ *
+ * Thread safety: a node set is immutable after create; multiple threads may
+ * concurrently pass it to beta_param_cache_compute_radius_and_derivative.
+ *
+ * @param cache            Cache the tables are sized to (must be non-NULL)
+ * @param thetas           Node angles in radians (need not be uniform)
+ * @param n_thetas         Number of nodes (>= 1)
+ * @param message_buf_len  Size of message_buf including null terminator
+ * @param message_buf      Buffer to receive failure reason (empty on success)
+ */
+beta_param_node_set_t* beta_param_node_set_create(
+        const beta_param_cache_t* cache, const double* thetas, int n_thetas,
+        int message_buf_len, char* message_buf);
+
+/** Destroy a node set. Null-safe. */
+void beta_param_node_set_destroy(beta_param_node_set_t* node_set);
+
+/**
+ * Resolve a shape once: pad + normalize params, run the COM iteration,
+ * polar pre-check. Node-set-independent — feed the resulting beta_con to
+ * beta_param_cache_compute_radius_and_derivative for any number of node sets.
+ * On failure all outputs are zero-filled.
+ *
+ * @param cache             Cache (must be non-NULL)
+ * @param params            Deformation parameters (beta10 is the COM dipole)
+ * @param n_params          Number of deformation parameters
+ * @param beta_con          Output; must hold at least the cache's max_beta_params doubles
+ * @param corrected_beta10  Receives the post-shift beta10
+ * @param r_north           Receives analytic R(0)
+ * @param r_south           Receives analytic R(pi)
+ * @param message_buf_len   Size of message_buf
+ * @param message_buf       Buffer to receive validation message (empty on success)
+ * @return                  BETA_PARAM_VALID (0) on success, error code otherwise
+ */
+int beta_param_cache_resolve_shape(
+        const beta_param_cache_t* cache, const double* params, int n_params,
+        double* beta_con, double* corrected_beta10, double* r_north, double* r_south,
+        int message_buf_len, char* message_buf);
+
+/**
+ * Evaluate R and dR/dtheta at a node set for a shape already resolved by
+ * beta_param_cache_resolve_shape. Dot products only — no iteration.
+ * On failure radii and dr_dtheta are zero-filled.
+ *
+ * @param cache            Cache (must be non-NULL)
+ * @param node_set         Node set built by this cache (must be non-NULL)
+ * @param beta_con         Resolved coefficients; n_beta_con must equal the
+ *                         cache's max_beta_params
+ * @param n_beta_con       Number of beta_con entries
+ * @param radii            Output R(theta_i); n_nodes doubles
+ * @param dr_dtheta        Output dR/dtheta(theta_i); n_nodes doubles
+ * @param n_nodes          Must equal the node set's node count
+ * @param message_buf_len  Size of message_buf
+ * @param message_buf      Buffer to receive validation message (empty on success)
+ * @return                 BETA_PARAM_VALID (0) on success, error code otherwise
+ */
+int beta_param_cache_compute_radius_and_derivative(
+        const beta_param_cache_t* cache, const beta_param_node_set_t* node_set,
+        const double* beta_con, int n_beta_con,
+        double* radii, double* dr_dtheta, int n_nodes,
         int message_buf_len, char* message_buf);
 
 /* --- Standalone single-shape (one-off, inefficient for batch) ---
