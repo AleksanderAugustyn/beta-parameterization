@@ -1,6 +1,6 @@
 /**
  * @file beta_parameterization.h
- * @brief C API for the Fortran beta parameterization library (v2.1.0).
+ * @brief C API for the Fortran beta parameterization library (v2.2.0).
  *
  * Two-tier API:
  *   - Cache-backed (recommended for batch use): create one cache up front,
