@@ -7,7 +7,8 @@ program beta_param_node_set_test
             precompute_legendre_derivative_table_s, eval_radius_derivative_s
     use beta_parameterization_mod, only: cache_t, node_set_t, LEGENDRE_VALID, &
             LEGENDRE_ERROR_POLE_NODE, LEGENDRE_ERROR_INVALID_BUFFER_SIZE, &
-            LEGENDRE_ERROR_INVALID_MAX_PARAMS, LEGENDRE_ERROR_EMPTY_PARAMS
+            LEGENDRE_ERROR_INVALID_MAX_PARAMS, LEGENDRE_ERROR_EMPTY_PARAMS, &
+            LEGENDRE_ERROR_INTERIOR_NEGATIVE
     use test_utils_mod, only: assert_true, assert_int_eq, assert_close, test_summary
 
     implicit none
@@ -16,6 +17,9 @@ program beta_param_node_set_test
     call test_radius_derivative_eval()
     call test_build_node_set()
     call test_resolve_shape()
+    call test_evaluate_uniform_parity()
+    call test_evaluate_fd_golden()
+    call test_evaluate_errors()
     call test_summary()
 
 contains
@@ -120,5 +124,118 @@ contains
         call cache%resolve_shape(params, bad_beta_con, corrected_beta10, r_north, r_south, code, message)
         call assert_int_eq(code, LEGENDRE_ERROR_INVALID_BUFFER_SIZE, 'resolve: beta_con size mismatch')
     end subroutine test_resolve_shape
+
+    !> Node-set evaluation at the uniform grid's own thetas must reproduce
+    !! compute_radius_grid_with_com_shift exactly (same beta_con, same tables,
+    !! same summation worker).
+    subroutine test_evaluate_uniform_parity()
+        type(cache_t)        :: cache
+        type(node_set_t)     :: node_set
+        real(kind = rk)      :: params(4), beta_con(8), radii_ref(181)
+        real(kind = rk)      :: thetas(179), radii(179), dr(179)
+        real(kind = rk)      :: corrected_beta10, corrected_ref, r_north, r_south
+        integer(kind = ik)   :: code, i
+        character(len = 256) :: message
+
+        call cache%init(8_ik, 181_ik, code, message)
+        params = [0.1_rk, 0.2_rk, 0.05_rk, 0.1_rk]
+
+        call cache%compute_radius_grid_with_com_shift(params, radii_ref, corrected_ref, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'parity: reference valid')
+
+        ! Interior uniform-grid thetas (skip the two poles)
+        do i = 1_ik, 179_ik
+            thetas(i) = real(i, rk) * PI_C / 180.0_rk
+        end do
+        call cache%build_node_set(thetas, node_set, code, message)
+        call cache%resolve_shape(params, beta_con, corrected_beta10, r_north, r_south, code, message)
+        call cache%compute_radius_and_derivative(beta_con, node_set, radii, dr, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'parity: evaluate valid')
+
+        do i = 1_ik, 179_ik
+            call assert_close(radii(i), radii_ref(i + 1), 1.0e-15_rk, 'parity: R matches uniform grid')
+        end do
+    end subroutine test_evaluate_uniform_parity
+
+    !> dR/dtheta against 5-point central FD of node-set R values, tol 1e-9
+    !! (spec gate), plus the beta2-only closed form at machine precision.
+    subroutine test_evaluate_fd_golden()
+        type(cache_t)        :: cache
+        type(node_set_t)     :: node_set, stencil_set
+        real(kind = rk), parameter :: h = 1.0e-3_rk
+        real(kind = rk)      :: params(5), params_b2(2), beta_con(8)
+        real(kind = rk)      :: thetas(5), stencil(20), r5(5), dr5(5), rs(20), drs(20)
+        real(kind = rk)      :: corrected_beta10, r_north, r_south, fd, expected
+        integer(kind = ik)   :: code, i
+        character(len = 256) :: message
+
+        call cache%init(8_ik, 181_ik, code, message)
+
+        thetas = [0.3_rk, 0.9_rk, PI_C / 2.0_rk, 2.2_rk, 2.9_rk]
+        do i = 1_ik, 5_ik
+            stencil(4 * i - 3) = thetas(i) - 2.0_rk * h
+            stencil(4 * i - 2) = thetas(i) - h
+            stencil(4 * i - 1) = thetas(i) + h
+            stencil(4 * i)     = thetas(i) + 2.0_rk * h
+        end do
+        call cache%build_node_set(thetas, node_set, code, message)
+        call cache%build_node_set(stencil, stencil_set, code, message)
+
+        params = [0.15_rk, 0.25_rk, 0.1_rk, 0.05_rk, 0.02_rk]
+        call cache%resolve_shape(params, beta_con, corrected_beta10, r_north, r_south, code, message)
+        call cache%compute_radius_and_derivative(beta_con, node_set, r5, dr5, code, message)
+        call cache%compute_radius_and_derivative(beta_con, stencil_set, rs, drs, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'fd: evaluate valid')
+
+        do i = 1_ik, 5_ik
+            fd = (rs(4 * i - 3) - 8.0_rk * rs(4 * i - 2) &
+                    + 8.0_rk * rs(4 * i - 1) - rs(4 * i)) / (12.0_rk * h)
+            call assert_close(dr5(i), fd, 1.0e-9_rk, 'fd: analytic dR/dtheta vs 5-point FD')
+        end do
+
+        ! beta2-only: dR/dtheta = -sin * beta_con(2) * 3cos, exactly
+        params_b2 = [0.0_rk, 0.3_rk]
+        call cache%resolve_shape(params_b2, beta_con, corrected_beta10, r_north, r_south, code, message)
+        call cache%compute_radius_and_derivative(beta_con, node_set, r5, dr5, code, message)
+        do i = 1_ik, 5_ik
+            expected = -sin(thetas(i)) * beta_con(2) * 3.0_rk * cos(thetas(i))
+            call assert_close(dr5(i), expected, 1.0e-14_rk, 'fd: b2 closed form end-to-end')
+        end do
+    end subroutine test_evaluate_fd_golden
+
+    subroutine test_evaluate_errors()
+        type(cache_t)        :: cache
+        type(node_set_t)     :: node_set, unbuilt
+        real(kind = rk)      :: params(2), beta_con(8), bad_beta_con(3)
+        real(kind = rk)      :: thetas(3), radii(3), dr(3), bad_radii(5)
+        real(kind = rk)      :: corrected_beta10, r_north, r_south
+        integer(kind = ik)   :: code, i
+        character(len = 256) :: message
+
+        call cache%init(8_ik, 181_ik, code, message)
+        thetas = [0.5_rk, PI_C / 2.0_rk, 2.5_rk]
+        call cache%build_node_set(thetas, node_set, code, message)
+
+        ! Interior-negative: beta2 large enough that R(pi/2) = 1 - beta_con(2)/2 < 0,
+        ! while both poles stay positive (even multipole, no COM shift).
+        params = [0.0_rk, 3.5_rk]
+        call cache%resolve_shape(params, beta_con, corrected_beta10, r_north, r_south, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'errors: extreme b2 resolves (poles positive)')
+        call cache%compute_radius_and_derivative(beta_con, node_set, radii, dr, code, message)
+        call assert_int_eq(code, LEGENDRE_ERROR_INTERIOR_NEGATIVE, 'errors: interior negative')
+        do i = 1_ik, 3_ik
+            call assert_close(radii(i), 0.0_rk, 1.0e-15_rk, 'errors: radii zero-filled')
+            call assert_close(dr(i), 0.0_rk, 1.0e-15_rk, 'errors: dr zero-filled')
+        end do
+
+        params = [0.0_rk, 0.3_rk]
+        call cache%resolve_shape(params, beta_con, corrected_beta10, r_north, r_south, code, message)
+        call cache%compute_radius_and_derivative(bad_beta_con, node_set, radii, dr, code, message)
+        call assert_int_eq(code, LEGENDRE_ERROR_INVALID_BUFFER_SIZE, 'errors: beta_con size mismatch')
+        call cache%compute_radius_and_derivative(beta_con, node_set, bad_radii, dr, code, message)
+        call assert_int_eq(code, LEGENDRE_ERROR_INVALID_BUFFER_SIZE, 'errors: radii size mismatch')
+        call cache%compute_radius_and_derivative(beta_con, unbuilt, radii, dr, code, message)
+        call assert_int_eq(code, LEGENDRE_ERROR_INVALID_BUFFER_SIZE, 'errors: unbuilt node set')
+    end subroutine test_evaluate_errors
 
 end program beta_param_node_set_test

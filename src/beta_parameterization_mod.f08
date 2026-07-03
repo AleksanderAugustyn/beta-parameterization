@@ -40,6 +40,7 @@ module beta_parameterization_mod
             precompute_legendre_derivative_table_s, &
             eval_polar_radii_s, &
             eval_radius_grid_s, &
+            eval_radius_derivative_s, &
             find_min_radius_s, &
             iterate_com_correction_s
 
@@ -114,6 +115,8 @@ module beta_parameterization_mod
                               => cache_compute_radius_grid_with_com_shift_s
         procedure, pass(self) :: build_node_set => cache_build_node_set_s
         procedure, pass(self) :: resolve_shape  => cache_resolve_shape_s
+        procedure, pass(self) :: compute_radius_and_derivative &
+                              => cache_compute_radius_and_derivative_s
         procedure, pass(self) :: max_beta_params_get
         procedure, pass(self) :: n_grid_get
         procedure, pass(self) :: is_initialized_get
@@ -446,6 +449,80 @@ contains
         end if
 
     end subroutine cache_resolve_shape_s
+
+    !> Evaluate R and dR/dtheta at a node set, for a shape already resolved by
+    !! resolve_shape. Dot products only — no iteration, no allocation.
+    !!
+    !! Defense-in-depth: the interior-positivity scan always reports
+    !! LEGENDRE_ERROR_INTERIOR_NEGATIVE (node sets exclude the poles, so the
+    !! uniform-grid pole-index mapping does not apply). Zero-fills on failure.
+    !!
+    !! @param[in]  beta_con    Resolved coefficients from resolve_shape;
+    !!                         size must equal cache max_beta_params
+    !! @param[in]  node_set    Built by this cache's build_node_set
+    !! @param[out] radii       R(theta_i); size must equal node set n_nodes
+    !! @param[out] dr_dthetas  dR/dtheta(theta_i); size must equal node set n_nodes
+    !! @param[out] error_code  LEGENDRE_VALID on success
+    !! @param[out] message     Empty on success
+    subroutine cache_compute_radius_and_derivative_s(self, beta_con, node_set, &
+            radii, dr_dthetas, error_code, message)
+
+        class(cache_t),     intent(in)  :: self
+        real(kind = rk),    intent(in)  :: beta_con(:)
+        type(node_set_t),   intent(in)  :: node_set
+        real(kind = rk),    intent(out) :: radii(:)
+        real(kind = rk),    intent(out) :: dr_dthetas(:)
+        integer(kind = ik), intent(out) :: error_code
+        character(len = *), intent(out) :: message
+
+        real(kind = rk)    :: r_min
+        integer(kind = ik) :: i_min
+
+        error_code    = LEGENDRE_VALID
+        message       = ''
+        radii(:)      = 0.0_rk
+        dr_dthetas(:) = 0.0_rk
+
+        if (.not. node_set%is_built) then
+            error_code = LEGENDRE_ERROR_INVALID_BUFFER_SIZE
+            message    = 'compute_radius_and_derivative: node set not built'
+            return
+        end if
+        if (size(node_set%legendre_table, 2, kind = ik) /= self%max_beta_params + 1_ik) then
+            error_code = LEGENDRE_ERROR_INVALID_BUFFER_SIZE
+            message    = 'compute_radius_and_derivative: node set built by a different cache'
+            return
+        end if
+        if (size(beta_con, kind = ik) /= self%max_beta_params) then
+            error_code = LEGENDRE_ERROR_INVALID_BUFFER_SIZE
+            write(message, '(A,I0,A,I0)') &
+                    'beta_con size ', size(beta_con), &
+                    ' does not match cache max_beta_params ', self%max_beta_params
+            return
+        end if
+        if (size(radii, kind = ik) /= node_set%n_nodes .or. &
+                size(dr_dthetas, kind = ik) /= node_set%n_nodes) then
+            error_code = LEGENDRE_ERROR_INVALID_BUFFER_SIZE
+            write(message, '(A,I0)') &
+                    'radii/dr_dthetas buffers must match node set n_nodes = ', node_set%n_nodes
+            return
+        end if
+
+        call eval_radius_grid_s(beta_con, node_set%legendre_table, radii)
+        call eval_radius_derivative_s(beta_con, node_set%legendre_deriv_table, &
+                node_set%sin_thetas, dr_dthetas)
+
+        call find_min_radius_s(radii, r_min, i_min)
+        if (r_min <= R_MIN_THRESHOLD) then
+            error_code = LEGENDRE_ERROR_INTERIOR_NEGATIVE
+            write(message, '(A,F8.4,A,ES12.4)') &
+                    'Radius not positive at theta = ', node_set%thetas(i_min), ', R = ', r_min
+            radii(:)      = 0.0_rk
+            dr_dthetas(:) = 0.0_rk
+            return
+        end if
+
+    end subroutine cache_compute_radius_and_derivative_s
 
     !===========================================================================
     ! HOT PATH
