@@ -3,7 +3,8 @@
 program beta_param_golden_test
 
     use precision_utilities_mod, only: ik, rk
-    use beta_parameterization_mod, only: cache_t, LEGENDRE_VALID
+    use mathematical_and_physical_constants_mod, only: PI_C
+    use beta_parameterization_mod, only: cache_t, node_set_t, LEGENDRE_VALID
     use test_utils_mod, only: assert_int_eq, assert_close, test_summary
 
     implicit none
@@ -46,6 +47,50 @@ program beta_param_golden_test
              1.1915473089293442E+000_rk]
     real(kind = rk), parameter :: G4_CORRECTED_B10 = -7.2500830051600282E-002_rk
 
+    ! Node-set goldens (captured by golden_capture, v2.2.0 node-set API):
+    ! layout [corrected_beta10, r_north, r_south, R(1:3), dR(1:3)] at
+    ! thetas = [pi/8, pi/2, 7pi/8].
+    real(kind = rk), parameter :: G1_NODE_SET_EXPECTED(9) = [ &
+             0.0000000000000000E+000_rk, &
+             1.2160153887141389E+000_rk, &
+             1.2160153887141389E+000_rk, &
+             1.1348983254477432E+000_rk, &
+             9.6233969434154143E-001_rk, &
+             1.1348983254477432E+000_rk, &
+            -3.5524427545959703E-001_rk, &
+             1.2009039485575869E-017_rk, &
+             3.5524427545959714E-001_rk]
+    real(kind = rk), parameter :: G2_NODE_SET_EXPECTED(9) = [ &
+            -2.0926908316026530E-001_rk, &
+             1.9145931553115429E+000_rk, &
+             1.5030848311140959E+000_rk, &
+             1.5366433412487048E+000_rk, &
+             7.8268444464280551E-001_rk, &
+             1.4071871239950646E+000_rk, &
+            -1.6309751173882105E+000_rk, &
+             4.0637180707528003E-001_rk, &
+             4.3722024621518629E-001_rk]
+    real(kind = rk), parameter :: G3_NODE_SET_EXPECTED(9) = [ &
+             0.0000000000000000E+000_rk, &
+             8.2154012308931779E-001_rk, &
+             8.2154012308931779E-001_rk, &
+             8.4302397766917225E-001_rk, &
+             1.1262548798756626E+000_rk, &
+             8.4302397766917225E-001_rk, &
+             1.2290351730043024E-001_rk, &
+             5.9988033154643641E-017_rk, &
+            -1.2290351730043028E-001_rk]
+    real(kind = rk), parameter :: G4_NODE_SET_EXPECTED(9) = [ &
+            -7.2500830051600282E-002_rk, &
+             1.5346514262195001E+000_rk, &
+             1.1915473089293445E+000_rk, &
+             1.2820856414035799E+000_rk, &
+             9.0081230258281431E-001_rk, &
+             1.1656292020106376E+000_rk, &
+            -1.0077766770385752E+000_rk, &
+             1.9551664231146185E-001_rk, &
+             1.2297403623871962E-001_rk]
+
     type(cache_t)        :: cache
     integer(kind = ik)   :: code
     character(len = 256) :: message
@@ -59,6 +104,13 @@ program beta_param_golden_test
     call check('G3', [0.0_rk, -0.35_rk, 0.0_rk, 0.05_rk], .false., G3_EXPECTED, 0.0_rk)
     call check('G4', [0.0_rk, 0.40_rk, 0.20_rk, 0.10_rk, 0.05_rk, 0.02_rk, 0.01_rk, 0.005_rk], &
             .true., G4_EXPECTED, G4_CORRECTED_B10)
+
+    call check_node_set('G1', [0.0_rk, 0.215_rk, 0.0_rk, 0.095_rk], G1_NODE_SET_EXPECTED)
+    call check_node_set('G2', [0.0_rk, 0.85_rk, 0.35_rk, 0.18_rk, 0.05_rk, 0.02_rk], &
+            G2_NODE_SET_EXPECTED)
+    call check_node_set('G3', [0.0_rk, -0.35_rk, 0.0_rk, 0.05_rk], G3_NODE_SET_EXPECTED)
+    call check_node_set('G4', [0.0_rk, 0.40_rk, 0.20_rk, 0.10_rk, 0.05_rk, 0.02_rk, 0.01_rk, 0.005_rk], &
+            G4_NODE_SET_EXPECTED)
     call test_summary()
 
 contains
@@ -82,5 +134,32 @@ contains
         end do
         if (with_shift) call assert_close(corrected, expected_b10, TOL, name // ': golden corrected beta10')
     end subroutine check
+
+    !> Locked node-set goldens: resolve + evaluate at thetas = [pi/8, pi/2, 7pi/8].
+    subroutine check_node_set(name, params, expected)
+        character(len = *), intent(in) :: name
+        real(kind = rk),    intent(in) :: params(:), expected(9)
+        type(node_set_t)     :: node_set
+        real(kind = rk)      :: thetas(3), beta_con(8), radii(3), dr(3)
+        real(kind = rk)      :: corrected_beta10, r_north, r_south
+        integer(kind = ik)   :: c, i
+        character(len = 256) :: msg
+
+        thetas = [PI_C / 8.0_rk, PI_C / 2.0_rk, 7.0_rk * PI_C / 8.0_rk]
+        call cache%build_node_set(thetas, node_set, c, msg)
+        call assert_int_eq(c, LEGENDRE_VALID, name // ': node set built')
+        call cache%resolve_shape(params, beta_con, corrected_beta10, r_north, r_south, c, msg)
+        call assert_int_eq(c, LEGENDRE_VALID, name // ': resolved')
+        call cache%compute_radius_and_derivative(beta_con, node_set, radii, dr, c, msg)
+        call assert_int_eq(c, LEGENDRE_VALID, name // ': evaluated')
+
+        call assert_close(corrected_beta10, expected(1), TOL, name // ': golden node-set corrected beta10')
+        call assert_close(r_north, expected(2), TOL, name // ': golden r_north')
+        call assert_close(r_south, expected(3), TOL, name // ': golden r_south')
+        do i = 1_ik, 3_ik
+            call assert_close(radii(i), expected(3 + i), TOL, name // ': golden node-set R')
+            call assert_close(dr(i), expected(6 + i), TOL, name // ': golden node-set dR/dtheta')
+        end do
+    end subroutine check_node_set
 
 end program beta_param_golden_test
