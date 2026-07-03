@@ -113,6 +113,7 @@ module beta_parameterization_mod
         procedure, pass(self) :: compute_radius_grid_with_com_shift &
                               => cache_compute_radius_grid_with_com_shift_s
         procedure, pass(self) :: build_node_set => cache_build_node_set_s
+        procedure, pass(self) :: resolve_shape  => cache_resolve_shape_s
         procedure, pass(self) :: max_beta_params_get
         procedure, pass(self) :: n_grid_get
         procedure, pass(self) :: is_initialized_get
@@ -346,6 +347,106 @@ contains
 
     end subroutine cache_build_node_set_s
 
+    !> Resolve a shape once: pad + normalize params, run the COM iteration,
+    !! polar pre-check. Node-set-independent — feed the resulting beta_con to
+    !! compute_radius_and_derivative for any number of node sets.
+    !!
+    !! On any failure all outputs are zero-filled.
+    !!
+    !! @param[in]  params            Deformation parameters (beta10 is the COM dipole)
+    !! @param[out] beta_con          Normalized, COM-corrected coefficients;
+    !!                               size must equal cache max_beta_params
+    !! @param[out] corrected_beta10  Post-shift beta10
+    !! @param[out] r_north           Analytic R(0) from eval_polar_radii_s
+    !! @param[out] r_south           Analytic R(pi) from eval_polar_radii_s
+    !! @param[out] error_code        LEGENDRE_VALID on success
+    !! @param[out] message           Empty on success
+    subroutine cache_resolve_shape_s(self, params, beta_con, corrected_beta10, &
+            r_north, r_south, error_code, message)
+
+        class(cache_t),     intent(in)  :: self
+        real(kind = rk),    intent(in)  :: params(:)
+        real(kind = rk),    intent(out) :: beta_con(:)
+        real(kind = rk),    intent(out) :: corrected_beta10
+        real(kind = rk),    intent(out) :: r_north
+        real(kind = rk),    intent(out) :: r_south
+        integer(kind = ik), intent(out) :: error_code
+        character(len = *), intent(out) :: message
+
+        real(kind = rk)    :: beta_local(self%max_beta_params)
+        integer(kind = ik) :: n_params, n_iter
+        logical            :: converged
+
+        error_code       = LEGENDRE_VALID
+        message          = ''
+        beta_con(:)      = 0.0_rk
+        corrected_beta10 = 0.0_rk
+        r_north          = 0.0_rk
+        r_south          = 0.0_rk
+
+        n_params = size(params, kind = ik)
+        if (n_params < 1_ik) then
+            error_code = LEGENDRE_ERROR_EMPTY_PARAMS
+            message    = 'params is empty'
+            return
+        end if
+        if (n_params > self%max_beta_params) then
+            error_code = LEGENDRE_ERROR_TOO_MANY_PARAMS
+            write(message, '(A,I0,A,I0)') &
+                    'params has ', n_params, &
+                    ' entries but cache built for max_beta_params = ', self%max_beta_params
+            return
+        end if
+        if (size(beta_con, kind = ik) /= self%max_beta_params) then
+            error_code = LEGENDRE_ERROR_INVALID_BUFFER_SIZE
+            write(message, '(A,I0,A,I0)') &
+                    'beta_con buffer size ', size(beta_con), &
+                    ' does not match cache max_beta_params ', self%max_beta_params
+            return
+        end if
+
+        beta_local(:)          = 0.0_rk
+        beta_local(1:n_params) = params(1:n_params)
+        beta_con(:)            = beta_local(:) * self%norm_constants(:)
+
+        call iterate_com_correction_s( &
+                beta_local, beta_con, self%norm_constants, &
+                self%gl_nodes, self%gl_weights, self%legendre_gl, &
+                converged, n_iter)
+
+        corrected_beta10 = beta_local(1)
+
+        if (.not. converged) then
+            error_code = LEGENDRE_ERROR_COM_NOT_CONVERGED
+            write(message, '(A,I0,A)') &
+                    'COM correction failed to converge after ', n_iter, ' iterations'
+            beta_con(:)      = 0.0_rk
+            corrected_beta10 = 0.0_rk
+            return
+        end if
+
+        call eval_polar_radii_s(beta_con, r_north, r_south)
+        if (r_north <= R_MIN_THRESHOLD) then
+            error_code = LEGENDRE_ERROR_NORTH_POLE
+            write(message, '(A,ES12.4)') 'North pole radius not positive: R(0) = ', r_north
+            beta_con(:)      = 0.0_rk
+            corrected_beta10 = 0.0_rk
+            r_north          = 0.0_rk
+            r_south          = 0.0_rk
+            return
+        end if
+        if (r_south <= R_MIN_THRESHOLD) then
+            error_code = LEGENDRE_ERROR_SOUTH_POLE
+            write(message, '(A,ES12.4)') 'South pole radius not positive: R(pi) = ', r_south
+            beta_con(:)      = 0.0_rk
+            corrected_beta10 = 0.0_rk
+            r_north          = 0.0_rk
+            r_south          = 0.0_rk
+            return
+        end if
+
+    end subroutine cache_resolve_shape_s
+
     !===========================================================================
     ! HOT PATH
     !===========================================================================
@@ -468,11 +569,9 @@ contains
         integer(kind = ik), intent(out) :: error_code
         character(len = *), intent(out) :: message
 
-        real(kind = rk) :: beta_local(self%max_beta_params)
         real(kind = rk) :: beta_con(self%max_beta_params)
         real(kind = rk) :: r_north, r_south, r_min, h, theta
-        integer(kind = ik) :: n_params, i_min, n_iter
-        logical :: converged
+        integer(kind = ik) :: n_params, i_min
 
         error_code       = LEGENDRE_VALID
         message          = ''
@@ -503,38 +602,12 @@ contains
             return
         end if
 
-        ! Step 3: pad and form beta_con
-        beta_local(:)          = 0.0_rk
-        beta_local(1:n_params) = params(1:n_params)
-        beta_con(:)            = beta_local(:) * self%norm_constants(:)
-
-        ! Step 4: COM iteration (modifies beta_local(1) and beta_con(1))
-        call iterate_com_correction_s( &
-                beta_local, beta_con, self%norm_constants, &
-                self%gl_nodes, self%gl_weights, self%legendre_gl, &
-                converged, n_iter)
-
-        corrected_beta10 = beta_local(1)
-
-        if (.not. converged) then
-            error_code = LEGENDRE_ERROR_COM_NOT_CONVERGED
-            write(message, '(A,I0,A)') &
-                    'COM correction failed to converge after ', n_iter, ' iterations'
-            return
-        end if
-
-        ! Step 5: polar pre-check (post-COM)
-        call eval_polar_radii_s(beta_con, r_north, r_south)
-        if (r_north <= R_MIN_THRESHOLD) then
-            error_code = LEGENDRE_ERROR_NORTH_POLE
-            write(message, '(A,ES12.4)') 'North pole radius not positive: R(0) = ', r_north
-            return
-        end if
-        if (r_south <= R_MIN_THRESHOLD) then
-            error_code = LEGENDRE_ERROR_SOUTH_POLE
-            write(message, '(A,ES12.4)') 'South pole radius not positive: R(pi) = ', r_south
-            return
-        end if
+        ! Steps 3-5 (normalization, COM iteration, polar pre-check) live in
+        ! resolve_shape; error codes and messages unchanged. Steps 1-2 above
+        ! stay inline so error precedence is untouched.
+        call self%resolve_shape(params, beta_con, corrected_beta10, r_north, r_south, &
+                error_code, message)
+        if (error_code /= LEGENDRE_VALID) return
 
         ! Step 6: grid evaluation
         call eval_radius_grid_s(beta_con, self%legendre_theta_grid, radii)

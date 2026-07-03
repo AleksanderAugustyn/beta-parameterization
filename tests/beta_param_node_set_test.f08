@@ -7,7 +7,7 @@ program beta_param_node_set_test
             precompute_legendre_derivative_table_s, eval_radius_derivative_s
     use beta_parameterization_mod, only: cache_t, node_set_t, LEGENDRE_VALID, &
             LEGENDRE_ERROR_POLE_NODE, LEGENDRE_ERROR_INVALID_BUFFER_SIZE, &
-            LEGENDRE_ERROR_INVALID_MAX_PARAMS
+            LEGENDRE_ERROR_INVALID_MAX_PARAMS, LEGENDRE_ERROR_EMPTY_PARAMS
     use test_utils_mod, only: assert_true, assert_int_eq, assert_close, test_summary
 
     implicit none
@@ -15,6 +15,7 @@ program beta_param_node_set_test
     call test_derivative_table_analytic()
     call test_radius_derivative_eval()
     call test_build_node_set()
+    call test_resolve_shape()
     call test_summary()
 
 contains
@@ -89,5 +90,35 @@ contains
         call cold_cache%build_node_set(thetas, node_set, code, message)
         call assert_int_eq(code, LEGENDRE_ERROR_INVALID_MAX_PARAMS, 'build: uninitialized cache rejected')
     end subroutine test_build_node_set
+
+    !> resolve_shape must reproduce the with_com_shift path: same corrected_beta10,
+    !! and r_north/r_south equal to the uniform grid endpoints (theta = 0 and pi
+    !! are on that grid; the library does not volume-scale).
+    subroutine test_resolve_shape()
+        type(cache_t)        :: cache
+        real(kind = rk)      :: params(4), beta_con(8), radii(181)
+        real(kind = rk)      :: corrected_beta10, corrected_ref, r_north, r_south
+        real(kind = rk)      :: bad_beta_con(3), empty(0)
+        integer(kind = ik)   :: code
+        character(len = 256) :: message
+
+        call cache%init(8_ik, 181_ik, code, message)
+        params = [0.1_rk, 0.2_rk, 0.05_rk, 0.1_rk]  ! odd terms -> COM iteration active
+
+        call cache%compute_radius_grid_with_com_shift(params, radii, corrected_ref, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'resolve: reference path valid')
+
+        call cache%resolve_shape(params, beta_con, corrected_beta10, r_north, r_south, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'resolve: valid')
+        call assert_close(corrected_beta10, corrected_ref, 1.0e-15_rk, 'resolve: corrected_beta10 parity')
+        call assert_close(r_north, radii(1), 1.0e-15_rk, 'resolve: r_north == R(0)')
+        call assert_close(r_south, radii(181), 1.0e-15_rk, 'resolve: r_south == R(pi)')
+
+        call cache%resolve_shape(empty, beta_con, corrected_beta10, r_north, r_south, code, message)
+        call assert_int_eq(code, LEGENDRE_ERROR_EMPTY_PARAMS, 'resolve: empty params')
+
+        call cache%resolve_shape(params, bad_beta_con, corrected_beta10, r_north, r_south, code, message)
+        call assert_int_eq(code, LEGENDRE_ERROR_INVALID_BUFFER_SIZE, 'resolve: beta_con size mismatch')
+    end subroutine test_resolve_shape
 
 end program beta_param_node_set_test
