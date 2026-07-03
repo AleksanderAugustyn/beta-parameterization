@@ -19,6 +19,7 @@ module beta_parameterization_workers_mod
     public :: precompute_legendre_derivative_table_s
     public :: eval_polar_radii_s
     public :: eval_radius_grid_s
+    public :: eval_radius_derivative_s
     public :: find_min_radius_s
     public :: compute_com_integrals_s
     public :: iterate_com_correction_s
@@ -143,6 +144,36 @@ contains
         end do
 
     end subroutine eval_radius_grid_s
+
+    !> dr_dthetas(i) = -sin(theta_i) * sum_k beta_con(k) * P_k'(cos theta_i).
+    !!
+    !! Chain rule on R(theta) = 1 + sum_k beta_con(k) * P_k(cos theta):
+    !! d/dtheta = -sin(theta) * d/dx.
+    !!
+    !! @param[in]  beta_con              beta x norm products (size = max_beta_params)
+    !! @param[in]  legendre_deriv_table  P_k' table. Shape (n_nodes, max_beta_params + 1)
+    !! @param[in]  sin_thetas            sin(theta_i) per node (size = n_nodes)
+    !! @param[out] dr_dthetas            dR/dtheta values (size = n_nodes)
+    pure subroutine eval_radius_derivative_s(beta_con, legendre_deriv_table, &
+            sin_thetas, dr_dthetas)
+
+        real(kind = rk), intent(in)  :: beta_con(:)
+        real(kind = rk), intent(in)  :: legendre_deriv_table(:, :)
+        real(kind = rk), intent(in)  :: sin_thetas(:)
+        real(kind = rk), intent(out) :: dr_dthetas(:)
+
+        integer(kind = ik) :: i, k
+        real(kind = rk)    :: acc
+
+        do i = 1_ik, size(dr_dthetas, kind = ik)
+            acc = 0.0_rk
+            do k = 1_ik, size(beta_con, kind = ik)
+                acc = acc + beta_con(k) * legendre_deriv_table(i, k + 1_ik)
+            end do
+            dr_dthetas(i) = -sin_thetas(i) * acc
+        end do
+
+    end subroutine eval_radius_derivative_s
 
     !> Return the minimum radius and its grid index.
     !!
