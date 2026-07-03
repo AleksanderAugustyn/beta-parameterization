@@ -5,12 +5,16 @@ program beta_param_node_set_test
     use mathematical_and_physical_constants_mod, only: PI_C
     use beta_parameterization_workers_mod, only: precompute_legendre_table_s, &
             precompute_legendre_derivative_table_s, eval_radius_derivative_s
+    use beta_parameterization_mod, only: cache_t, node_set_t, LEGENDRE_VALID, &
+            LEGENDRE_ERROR_POLE_NODE, LEGENDRE_ERROR_INVALID_BUFFER_SIZE, &
+            LEGENDRE_ERROR_INVALID_MAX_PARAMS
     use test_utils_mod, only: assert_true, assert_int_eq, assert_close, test_summary
 
     implicit none
 
     call test_derivative_table_analytic()
     call test_radius_derivative_eval()
+    call test_build_node_set()
     call test_summary()
 
 contains
@@ -56,5 +60,34 @@ contains
             call assert_close(dr(i), expected, 1.0e-14_rk, 'radius derivative: b2 closed form')
         end do
     end subroutine test_radius_derivative_eval
+
+    subroutine test_build_node_set()
+        type(cache_t)        :: cache, cold_cache
+        type(node_set_t)     :: node_set
+        real(kind = rk)      :: thetas(8), pole_thetas(2), empty(0)
+        integer(kind = ik)   :: code, i
+        character(len = 256) :: message
+
+        call cache%init(8_ik, 181_ik, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'build: cache init')
+
+        do i = 1_ik, 8_ik
+            thetas(i) = real(i, rk) * PI_C / 9.0_rk
+        end do
+        call cache%build_node_set(thetas, node_set, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'build: valid mid thetas')
+        call assert_true(node_set%is_built_get(), 'build: is_built set')
+        call assert_int_eq(node_set%n_nodes_get(), 8_ik, 'build: n_nodes')
+
+        pole_thetas = [0.0_rk, PI_C / 2.0_rk]
+        call cache%build_node_set(pole_thetas, node_set, code, message)
+        call assert_int_eq(code, LEGENDRE_ERROR_POLE_NODE, 'build: pole node rejected')
+
+        call cache%build_node_set(empty, node_set, code, message)
+        call assert_int_eq(code, LEGENDRE_ERROR_INVALID_BUFFER_SIZE, 'build: empty thetas rejected')
+
+        call cold_cache%build_node_set(thetas, node_set, code, message)
+        call assert_int_eq(code, LEGENDRE_ERROR_INVALID_MAX_PARAMS, 'build: uninitialized cache rejected')
+    end subroutine test_build_node_set
 
 end program beta_param_node_set_test

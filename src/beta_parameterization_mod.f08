@@ -37,6 +37,7 @@ module beta_parameterization_mod
             compute_gauss_legendre_quadrature_s
     use beta_parameterization_workers_mod, only: &
             precompute_legendre_table_s, &
+            precompute_legendre_derivative_table_s, &
             eval_polar_radii_s, &
             eval_radius_grid_s, &
             find_min_radius_s, &
@@ -74,6 +75,7 @@ module beta_parameterization_mod
     integer(kind = ik), parameter, public :: LEGENDRE_ERROR_TOO_MANY_PARAMS     = 6_ik
     integer(kind = ik), parameter, public :: LEGENDRE_ERROR_COM_NOT_CONVERGED   = 7_ik
     integer(kind = ik), parameter, public :: LEGENDRE_ERROR_INVALID_BUFFER_SIZE = 8_ik
+    integer(kind = ik), parameter, public :: LEGENDRE_ERROR_POLE_NODE          = 9_ik
 
     !---------------------------------------------------------------------------
     ! Validation thresholds (policy — workers compute, API decides)
@@ -110,11 +112,31 @@ module beta_parameterization_mod
                               => cache_compute_radius_grid_s
         procedure, pass(self) :: compute_radius_grid_with_com_shift &
                               => cache_compute_radius_grid_with_com_shift_s
+        procedure, pass(self) :: build_node_set => cache_build_node_set_s
         procedure, pass(self) :: max_beta_params_get
         procedure, pass(self) :: n_grid_get
         procedure, pass(self) :: is_initialized_get
         final :: cache_final
     end type cache_t
+
+    !> A caller-owned set of theta nodes with precomputed Legendre P_k and P_k'
+    !! tables sized to one cache's max_beta_params. Built once (startup), then
+    !! reused across shapes. Carries no shape data; immutable after build and
+    !! safe to share across threads read-only. Deliberately generic: no
+    !! dense/folding/coulomb vocabulary — the caller owns what a set means.
+    type, public :: node_set_t
+        private
+        logical            :: is_built = .false.
+        integer(kind = ik) :: n_nodes  = 0_ik
+        real(kind = rk), allocatable :: thetas(:)
+        real(kind = rk), allocatable :: sin_thetas(:)
+        real(kind = rk), allocatable :: legendre_table(:, :)        ! P_k(cos theta_i)
+        real(kind = rk), allocatable :: legendre_deriv_table(:, :)  ! P_k'(cos theta_i)
+    contains
+        procedure, pass(self) :: is_built_get => node_set_is_built_get
+        procedure, pass(self) :: n_nodes_get  => node_set_n_nodes_get
+        procedure, pass(self) :: destroy      => node_set_destroy_s
+    end type node_set_t
 
 contains
 
@@ -233,6 +255,96 @@ contains
         logical :: b
         b = self%is_initialized
     end function
+
+    !===========================================================================
+    ! NODE SETS
+    !===========================================================================
+
+    pure function node_set_is_built_get(self) result(b)
+        class(node_set_t), intent(in) :: self
+        logical :: b
+        b = self%is_built
+    end function node_set_is_built_get
+
+    pure function node_set_n_nodes_get(self) result(n)
+        class(node_set_t), intent(in) :: self
+        integer(kind = ik) :: n
+        n = self%n_nodes
+    end function node_set_n_nodes_get
+
+    !> Deallocate all components and reset flags. Safe on an unbuilt set.
+    pure subroutine node_set_destroy_s(self)
+        class(node_set_t), intent(inout) :: self
+        if (allocated(self%thetas))               deallocate(self%thetas)
+        if (allocated(self%sin_thetas))           deallocate(self%sin_thetas)
+        if (allocated(self%legendre_table))       deallocate(self%legendre_table)
+        if (allocated(self%legendre_deriv_table)) deallocate(self%legendre_deriv_table)
+        self%is_built = .false.
+        self%n_nodes  = 0_ik
+    end subroutine node_set_destroy_s
+
+    !> Precompute P_k and P_k' tables at caller-supplied theta nodes.
+    !!
+    !! Pole nodes (1 - cos(theta)**2 == 0 in double precision) are rejected with
+    !! LEGENDRE_ERROR_POLE_NODE: the derivative recursion divides by 1 - x**2.
+    !! Gauss-Legendre nodes never land there; pole radii come analytically from
+    !! resolve_shape instead.
+    !!
+    !! @param[in]  thetas      Node angles (radians); any order, need not be uniform
+    !! @param[out] node_set    Filled tables (intent(out) resets any prior build)
+    !! @param[out] error_code  LEGENDRE_VALID on success
+    !! @param[out] message     Empty on success
+    subroutine cache_build_node_set_s(self, thetas, node_set, error_code, message)
+
+        class(cache_t),     intent(in)  :: self
+        real(kind = rk),    intent(in)  :: thetas(:)
+        type(node_set_t),   intent(out) :: node_set
+        integer(kind = ik), intent(out) :: error_code
+        character(len = *), intent(out) :: message
+
+        integer(kind = ik) :: n, i
+        real(kind = rk), allocatable :: x(:)
+
+        error_code = LEGENDRE_VALID
+        message    = ''
+
+        if (.not. self%is_initialized) then
+            error_code = LEGENDRE_ERROR_INVALID_MAX_PARAMS  ! reuse — API misuse, like cache_init_s
+            message    = 'build_node_set: cache not initialized'
+            return
+        end if
+
+        n = size(thetas, kind = ik)
+        if (n < 1_ik) then
+            error_code = LEGENDRE_ERROR_INVALID_BUFFER_SIZE
+            message    = 'build_node_set: thetas is empty'
+            return
+        end if
+
+        allocate(x(n))
+        x = cos(thetas)
+        do i = 1_ik, n
+            if (1.0_rk - x(i)**2 <= 0.0_rk) then
+                error_code = LEGENDRE_ERROR_POLE_NODE
+                write(message, '(A,ES12.4,A)') &
+                        'build_node_set: node at theta = ', thetas(i), &
+                        ' is a pole; use resolve_shape polar radii instead'
+                return
+            end if
+        end do
+
+        node_set%n_nodes = n
+        allocate(node_set%thetas(n), node_set%sin_thetas(n))
+        node_set%thetas     = thetas
+        node_set%sin_thetas = sin(thetas)
+        allocate(node_set%legendre_table(n, self%max_beta_params + 1_ik))
+        allocate(node_set%legendre_deriv_table(n, self%max_beta_params + 1_ik))
+        call precompute_legendre_table_s(x, self%max_beta_params, node_set%legendre_table)
+        call precompute_legendre_derivative_table_s(x, self%max_beta_params, &
+                node_set%legendre_table, node_set%legendre_deriv_table)
+        node_set%is_built = .true.
+
+    end subroutine cache_build_node_set_s
 
     !===========================================================================
     ! HOT PATH
