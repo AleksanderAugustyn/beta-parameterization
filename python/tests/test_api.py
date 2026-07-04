@@ -158,3 +158,28 @@ def test_resolve_shape_no_com_flag() -> None:
         with cache.build_node_set(interior) as ns:
             res = cache.radius_and_derivative(no_com.beta_con, ns)
             np.testing.assert_allclose(res.radii, ref.radii[1:-1], rtol=0.0, atol=1e-15)
+
+
+def test_node_set_only_cache_matches_full() -> None:
+    thetas = np.linspace(0.2, np.pi - 0.2, 9)
+    with bp.Cache(max_beta_params=8) as lean, \
+            bp.Cache(max_beta_params=8, n_grid=181) as full:
+        assert lean.n_grid == 0
+        rs_lean = lean.resolve_shape(G2_PARAMS)
+        rs_full = full.resolve_shape(G2_PARAMS)
+        assert rs_lean.ok and rs_full.ok
+        assert rs_lean.corrected_beta10 == rs_full.corrected_beta10
+        rd_lean = lean.radius_and_derivative(rs_lean.beta_con, lean.build_node_set(thetas))
+        rd_full = full.radius_and_derivative(rs_full.beta_con, full.build_node_set(thetas))
+        assert rd_lean.ok and rd_full.ok
+        np.testing.assert_array_equal(rd_lean.radii, rd_full.radii)
+        np.testing.assert_array_equal(rd_lean.dr_dtheta, rd_full.dr_dtheta)
+
+
+def test_node_set_only_cache_rejects_uniform_entry_points() -> None:
+    with bp.Cache(max_beta_params=8) as lean:
+        res = lean.radius_grid(G1_PARAMS)
+        assert res.status == bp.Status.ERROR_NO_UNIFORM_GRID
+        assert not res.ok
+        res_com = lean.radius_grid_with_com_shift(G1_PARAMS)
+        assert res_com.status == bp.Status.ERROR_NO_UNIFORM_GRID
