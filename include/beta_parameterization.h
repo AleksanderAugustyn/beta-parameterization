@@ -141,6 +141,10 @@ void beta_param_node_set_destroy(beta_param_node_set_t* node_set);
  * @param corrected_beta10  Receives the post-shift beta10
  * @param r_north           Receives analytic R(0)
  * @param r_south           Receives analytic R(pi)
+ * @param apply_com_correction  Nonzero (default behavior): run the COM
+ *                              iteration. Zero: skip it; corrected_beta10
+ *                              receives the input beta10 (no-COM semantics
+ *                              of beta_param_compute_radius_grid).
  * @param message_buf_len   Size of message_buf
  * @param message_buf       Buffer to receive validation message (empty on success)
  * @return                  BETA_PARAM_VALID (0) on success, error code otherwise
@@ -148,7 +152,7 @@ void beta_param_node_set_destroy(beta_param_node_set_t* node_set);
 int beta_param_cache_resolve_shape(
         const beta_param_cache_t* cache, const double* params, int n_params,
         double* beta_con, double* corrected_beta10, double* r_north, double* r_south,
-        int message_buf_len, char* message_buf);
+        int apply_com_correction, int message_buf_len, char* message_buf);
 
 /**
  * Evaluate R and dR/dtheta at a node set for a shape already resolved by

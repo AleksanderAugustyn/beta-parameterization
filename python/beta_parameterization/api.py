@@ -211,11 +211,16 @@ class Cache:
                 f"NodeSet build failed: {buf.value.decode(errors='replace')}")
         return NodeSet(ctypes.c_void_p(ns_handle), int(arr.size))
 
-    def resolve_shape(self, params: npt.ArrayLike) -> ResolvedShape:
+    def resolve_shape(self, params: npt.ArrayLike,
+                      apply_com_correction: bool = True) -> ResolvedShape:
         """Resolve a shape once (COM iteration + polar pre-check).
 
         Node-set-independent: feed the returned beta_con to
         radius_and_derivative for any number of node sets.
+
+        apply_com_correction=False skips the COM iteration
+        (corrected_beta10 = input beta10), matching radius_grid's
+        no-COM semantics.
         """
         handle = self._require_handle()
         arr = _as_params(params)
@@ -229,6 +234,7 @@ class Cache:
             arr.ctypes.data_as(c_dbl_p), arr.size,
             beta_con.ctypes.data_as(c_dbl_p),
             ctypes.byref(corrected), ctypes.byref(r_north), ctypes.byref(r_south),
+            1 if apply_com_correction else 0,
             MESSAGE_BUFFER_SIZE, buf)
         return ResolvedShape(
             beta_con=beta_con, corrected_beta10=corrected.value,

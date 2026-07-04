@@ -135,9 +135,16 @@ int main() {
         double corrected_beta10 = -1.0, r_north = -1.0, r_south = -1.0;
         int st = beta_param_cache_resolve_shape(
                 ns_cache, ns_params, 4, beta_con, &corrected_beta10, &r_north, &r_south,
-                static_cast<int>(nbuf.size()), nbuf.data());
+                1, static_cast<int>(nbuf.size()), nbuf.data());
         check(st == BETA_PARAM_VALID, "C: resolve_shape VALID");
         check(r_north > 0.0 && r_south > 0.0, "C: resolve_shape pole radii positive");
+
+        double corrected_no_com = -1.0;
+        st = beta_param_cache_resolve_shape(
+                ns_cache, ns_params, 4, beta_con, &corrected_no_com, &r_north, &r_south,
+                0, static_cast<int>(nbuf.size()), nbuf.data());
+        check(st == BETA_PARAM_VALID, "C: resolve_shape no-COM VALID");
+        check(corrected_no_com == 0.1, "C: no-COM corrected_beta10 == input beta10");
 
         double ns_radii[3], ns_dr[3];
         st = beta_param_cache_compute_radius_and_derivative(

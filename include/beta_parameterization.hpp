@@ -135,7 +135,8 @@ public:
             double&                 corrected_beta10,
             double&                 r_north,
             double&                 r_south,
-            std::string&            message) const
+            std::string&            message,
+            bool                    apply_com_correction = true) const
     {
         if (static_cast<int>(beta_con.size()) != max_beta_params_) {
             message = "beta_con buffer size " + std::to_string(beta_con.size())
@@ -150,6 +151,7 @@ public:
                 handle_,
                 params.data(), static_cast<int>(params.size()),
                 beta_con.data(), &corrected_beta10, &r_north, &r_south,
+                apply_com_correction ? 1 : 0,
                 static_cast<int>(buf.size()), buf.data());
         message.assign(buf.data());
         return static_cast<Status>(s);

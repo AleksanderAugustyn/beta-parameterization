@@ -142,3 +142,19 @@ def test_node_set_pole_rejected() -> None:
     with bp.Cache(8, 181) as cache:
         with pytest.raises(bp.BetaParamError, match="pole"):
             cache.build_node_set(np.array([0.0, 1.0]))
+
+
+def test_resolve_shape_no_com_flag() -> None:
+    params = [0.1, 0.2, 0.05, 0.1]
+    with bp.Cache(8, 181) as cache:
+        com = cache.resolve_shape(params)
+        no_com = cache.resolve_shape(params, apply_com_correction=False)
+        assert com.ok and no_com.ok
+        assert no_com.corrected_beta10 == 0.1        # input beta10 untouched
+        assert com.corrected_beta10 != 0.1           # COM iteration moved it
+        # no-COM parity with the legacy uniform-grid API (compute_radius_grid)
+        ref = cache.radius_grid(params)
+        interior = bp.theta_grid(181)[1:-1]
+        with cache.build_node_set(interior) as ns:
+            res = cache.radius_and_derivative(no_com.beta_con, ns)
+            np.testing.assert_allclose(res.radii, ref.radii[1:-1], rtol=0.0, atol=1e-15)
