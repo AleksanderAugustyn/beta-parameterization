@@ -77,6 +77,7 @@ module beta_parameterization_mod
     integer(kind = ik), parameter, public :: LEGENDRE_ERROR_COM_NOT_CONVERGED   = 7_ik
     integer(kind = ik), parameter, public :: LEGENDRE_ERROR_INVALID_BUFFER_SIZE = 8_ik
     integer(kind = ik), parameter, public :: LEGENDRE_ERROR_POLE_NODE          = 9_ik
+    integer(kind = ik), parameter, public :: LEGENDRE_ERROR_NO_UNIFORM_GRID    = 10_ik
 
     !---------------------------------------------------------------------------
     ! Validation thresholds (policy — workers compute, API decides)
@@ -155,14 +156,18 @@ contains
     !!
     !! @param[out] self            The cache (intent(out) auto-finalizes any prior state)
     !! @param[in]  max_beta_params 1 ≤ N ≤ MAX_BETA_PARAMS_LIMIT
-    !! @param[in]  n_grid          Number of θ grid points (≥ 2)
+    !! @param[in]  n_grid          Optional number of θ grid points (≥ 2) for
+    !!                             the legacy uniform-grid entry points. Absent
+    !!                             ⇒ node-set-only cache: the uniform table is
+    !!                             not allocated and compute_radius_grid[_with_
+    !!                             com_shift] return LEGENDRE_ERROR_NO_UNIFORM_GRID.
     !! @param[out] error_code      LEGENDRE_VALID on success, else error code
     !! @param[out] message         Human-readable error message (empty on success)
     subroutine cache_init_s(self, max_beta_params, n_grid, error_code, message)
 
         class(cache_t),     intent(out) :: self
         integer(kind = ik), intent(in)  :: max_beta_params
-        integer(kind = ik), intent(in)  :: n_grid
+        integer(kind = ik), intent(in), optional :: n_grid
         integer(kind = ik), intent(out) :: error_code
         character(len = *), intent(out) :: message
 
@@ -181,14 +186,18 @@ contains
             return
         end if
 
-        if (n_grid < 2_ik) then
-            error_code = LEGENDRE_ERROR_INVALID_MAX_PARAMS  ! reuse — bad init parameter
-            write(message, '(A,I0)') 'n_grid must be >= 2, got ', n_grid
-            return
+        if (present(n_grid)) then
+            if (n_grid < 2_ik) then
+                error_code = LEGENDRE_ERROR_INVALID_MAX_PARAMS  ! reuse — bad init parameter
+                write(message, '(A,I0)') 'n_grid must be >= 2, got ', n_grid
+                return
+            end if
+            self%n_grid = n_grid
+        else
+            self%n_grid = 0_ik    ! node-set-only cache: no uniform table
         end if
 
         self%max_beta_params = max_beta_params
-        self%n_grid          = n_grid
         self%n_quad          = 512_ik
 
         ! Normalization constants C_λ for λ = 1..max_beta_params
@@ -201,15 +210,17 @@ contains
         call compute_gauss_legendre_quadrature_s( &
                 self%n_quad, self%gl_nodes, self%gl_weights)
 
-        ! Legendre P_k at the θ grid: x_i = cos(θ_i), θ_i = (i-1) * π/(n_grid-1)
-        allocate(self%legendre_theta_grid(n_grid, max_beta_params + 1_ik))
-        allocate(theta_x(n_grid))
-        h = PI_C / real(n_grid - 1_ik, rk)
-        do i = 1_ik, n_grid
-            theta_x(i) = cos(real(i - 1_ik, rk) * h)
-        end do
-        call precompute_legendre_table_s(theta_x, max_beta_params, self%legendre_theta_grid)
-        deallocate(theta_x)
+        ! Legendre P_k at the θ grid — only when a uniform grid was requested.
+        if (present(n_grid)) then
+            allocate(self%legendre_theta_grid(n_grid, max_beta_params + 1_ik))
+            allocate(theta_x(n_grid))
+            h = PI_C / real(n_grid - 1_ik, rk)
+            do i = 1_ik, n_grid
+                theta_x(i) = cos(real(i - 1_ik, rk) * h)
+            end do
+            call precompute_legendre_table_s(theta_x, max_beta_params, self%legendre_theta_grid)
+            deallocate(theta_x)
+        end if
 
         ! Legendre P_k at the GL nodes
         allocate(self%legendre_gl(self%n_quad, max_beta_params + 1_ik))
@@ -567,6 +578,12 @@ contains
         message    = ''
         radii(:)   = 0.0_rk
 
+        if (self%n_grid == 0_ik) then
+            error_code = LEGENDRE_ERROR_NO_UNIFORM_GRID
+            message    = 'cache built without a uniform grid (init n_grid absent); use the node-set API'
+            return
+        end if
+
         ! Step 1: param-count check
         n_params = size(params, kind = ik)
         if (n_params < 1_ik) then
@@ -666,6 +683,12 @@ contains
         message          = ''
         radii(:)         = 0.0_rk
         corrected_beta10 = 0.0_rk
+
+        if (self%n_grid == 0_ik) then
+            error_code = LEGENDRE_ERROR_NO_UNIFORM_GRID
+            message    = 'cache built without a uniform grid (init n_grid absent); use the node-set API'
+            return
+        end if
 
         ! Step 1: param-count check
         n_params = size(params, kind = ik)

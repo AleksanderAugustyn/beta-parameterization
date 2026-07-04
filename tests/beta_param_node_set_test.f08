@@ -8,7 +8,7 @@ program beta_param_node_set_test
     use beta_parameterization_mod, only: cache_t, node_set_t, LEGENDRE_VALID, &
             LEGENDRE_ERROR_POLE_NODE, LEGENDRE_ERROR_INVALID_BUFFER_SIZE, &
             LEGENDRE_ERROR_INVALID_MAX_PARAMS, LEGENDRE_ERROR_EMPTY_PARAMS, &
-            LEGENDRE_ERROR_INTERIOR_NEGATIVE
+            LEGENDRE_ERROR_INTERIOR_NEGATIVE, LEGENDRE_ERROR_NO_UNIFORM_GRID
     use test_utils_mod, only: assert_true, assert_int_eq, assert_close, test_summary
 
     implicit none
@@ -21,6 +21,7 @@ program beta_param_node_set_test
     call test_evaluate_uniform_parity()
     call test_evaluate_fd_golden()
     call test_evaluate_errors()
+    call test_node_set_only_cache()
     call test_summary()
 
 contains
@@ -276,5 +277,59 @@ contains
         call cache%compute_radius_and_derivative(beta_con, unbuilt, radii, dr, code, message)
         call assert_int_eq(code, LEGENDRE_ERROR_INVALID_BUFFER_SIZE, 'errors: unbuilt node set')
     end subroutine test_evaluate_errors
+
+    !> A cache built without n_grid serves the node-set API identically to a
+    !> uniform-grid cache; the legacy uniform entry points refuse cleanly.
+    subroutine test_node_set_only_cache()
+        type(cache_t)        :: full, lean
+        type(node_set_t)     :: ns_full, ns_lean
+        real(kind = rk)      :: thetas(5), params(4)
+        real(kind = rk)      :: bc_full(8), bc_lean(8)
+        real(kind = rk)      :: r_full(5), r_lean(5), dr_full(5), dr_lean(5)
+        real(kind = rk)      :: radii_buf(181)
+        real(kind = rk)      :: corr_full, corr_lean, rn_f, rs_f, rn_l, rs_l
+        integer(kind = ik)   :: code, i
+        character(len = 256) :: message
+
+        call lean%init(8_ik, error_code = code, message = message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'lean init: VALID')
+        call assert_int_eq(lean%n_grid_get(), 0_ik, 'lean init: n_grid == 0')
+
+        call full%init(8_ik, 181_ik, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'full init: VALID')
+
+        thetas = [0.3_rk, 0.9_rk, 1.5_rk, 2.1_rk, 2.7_rk]
+        params = [0.0_rk, 0.85_rk, 0.35_rk, 0.18_rk]
+
+        call lean%build_node_set(thetas, ns_lean, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'lean node set: built')
+        call full%build_node_set(thetas, ns_full, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'full node set: built')
+
+        call lean%resolve_shape(params, bc_lean, corr_lean, rn_l, rs_l, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'lean resolve: VALID')
+        call full%resolve_shape(params, bc_full, corr_full, rn_f, rs_f, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'full resolve: VALID')
+        call assert_close(corr_lean, corr_full, 0.0_rk, 'resolve: corrected_beta10 identical')
+        call assert_close(rn_l, rn_f, 0.0_rk, 'resolve: r_north identical')
+        call assert_close(rs_l, rs_f, 0.0_rk, 'resolve: r_south identical')
+
+        call lean%compute_radius_and_derivative(bc_lean, ns_lean, r_lean, dr_lean, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'lean evaluate: VALID')
+        call full%compute_radius_and_derivative(bc_full, ns_full, r_full, dr_full, code, message)
+        call assert_int_eq(code, LEGENDRE_VALID, 'full evaluate: VALID')
+        do i = 1_ik, 5_ik
+            call assert_close(r_lean(i), r_full(i), 0.0_rk, 'evaluate: radii identical')
+            call assert_close(dr_lean(i), dr_full(i), 0.0_rk, 'evaluate: dr identical')
+        end do
+
+        call lean%compute_radius_grid(params, radii_buf, code, message)
+        call assert_int_eq(code, LEGENDRE_ERROR_NO_UNIFORM_GRID, &
+                'lean radius_grid: NO_UNIFORM_GRID')
+        call assert_true(len_trim(message) > 0, 'lean radius_grid: message non-empty')
+        call lean%compute_radius_grid_with_com_shift(params, radii_buf, corr_lean, code, message)
+        call assert_int_eq(code, LEGENDRE_ERROR_NO_UNIFORM_GRID, &
+                'lean com radius_grid: NO_UNIFORM_GRID')
+    end subroutine test_node_set_only_cache
 
 end program beta_param_node_set_test
