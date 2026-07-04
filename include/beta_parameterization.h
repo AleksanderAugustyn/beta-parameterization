@@ -50,6 +50,7 @@ extern "C" {
 #define BETA_PARAM_ERROR_COM_NOT_CONVERGED   7
 #define BETA_PARAM_ERROR_INVALID_BUFFER_SIZE 8
 #define BETA_PARAM_ERROR_POLE_NODE           9
+#define BETA_PARAM_ERROR_NO_UNIFORM_GRID     10
 
 /* --- Opaque cache handle --- */
 typedef struct beta_param_cache beta_param_cache_t;
@@ -63,7 +64,11 @@ typedef struct beta_param_node_set beta_param_node_set_t;
  * Create a cache. Returns NULL on failure (reason in message_buf).
  *
  * @param max_beta_params  1 .. BETA_PARAM_MAX_PARAMS_LIMIT
- * @param n_grid           Number of θ grid points (>= 2)
+ * @param n_grid           Number of θ grid points (>= 2). n_grid <= 0 builds a
+ *                         node-set-only cache: the uniform-grid entry points
+ *                         (beta_param_cache_compute_radius_grid[_with_com_shift])
+ *                         then return BETA_PARAM_ERROR_NO_UNIFORM_GRID; the
+ *                         node-set API is unaffected.
  * @param message_buf_len  Size of message_buf including null terminator
  * @param message_buf      Buffer to receive failure reason (empty on success)
  */

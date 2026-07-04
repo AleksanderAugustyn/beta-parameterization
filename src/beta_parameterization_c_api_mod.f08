@@ -77,9 +77,13 @@ contains
         character(len = 256)   :: f_message
 
         allocate(cache_ptr)
-        call cache_ptr%init( &
-                int(max_beta_params, ik), int(n_grid, ik), &
-                error_code, f_message)
+        if (n_grid <= 0_ik_c) then
+            call cache_ptr%init(int(max_beta_params, ik), &
+                    error_code = error_code, message = f_message)
+        else
+            call cache_ptr%init(int(max_beta_params, ik), int(n_grid, ik), &
+                    error_code, f_message)
+        end if
 
         if (error_code /= LEGENDRE_VALID) then
             deallocate(cache_ptr)

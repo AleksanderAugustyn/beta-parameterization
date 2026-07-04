@@ -38,6 +38,7 @@ class Status(IntEnum):
     ERROR_COM_NOT_CONVERGED = 7
     ERROR_INVALID_BUFFER_SIZE = 8
     POLE_NODE = 9
+    ERROR_NO_UNIFORM_GRID = 10
 
 
 @dataclass(frozen=True)
@@ -126,19 +127,23 @@ class Cache:
     Construction raises BetaParamError on invalid arguments; the hot path
     returns RadiusGridResult with a Status instead of raising, so parameter
     sweeps can render invalid shapes. Safe to share across threads.
+
+    n_grid=None builds a node-set-only cache; the uniform-grid entry points
+    then return Status.ERROR_NO_UNIFORM_GRID.
     """
 
-    def __init__(self, max_beta_params: int, n_grid: int) -> None:
+    def __init__(self, max_beta_params: int, n_grid: int | None = None) -> None:
         lib = _get_lib()
         buf = ctypes.create_string_buffer(MESSAGE_BUFFER_SIZE)
+        c_n_grid = 0 if n_grid is None else int(n_grid)
         handle = lib.beta_param_cache_create(
-            int(max_beta_params), int(n_grid), MESSAGE_BUFFER_SIZE, buf)
+            int(max_beta_params), c_n_grid, MESSAGE_BUFFER_SIZE, buf)
         if not handle:
             raise BetaParamError(
                 f"Cache init failed: {buf.value.decode(errors='replace')}")
         self._handle: Optional[ctypes.c_void_p] = ctypes.c_void_p(handle)
         self.max_beta_params = int(max_beta_params)
-        self.n_grid = int(n_grid)
+        self.n_grid = c_n_grid
 
     def close(self) -> None:
         if getattr(self, "_handle", None) is not None:

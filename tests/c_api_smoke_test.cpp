@@ -89,6 +89,18 @@ int main() {
     beta_param_cache_destroy(cache);
     beta_param_cache_destroy(nullptr);   // null-safe by contract
 
+    // --- Node-set-only cache: n_grid <= 0 sentinel ---
+    beta_param_cache_t* lean = beta_param_cache_create(
+            8, 0, static_cast<int>(buf.size()), buf.data());
+    check(lean != nullptr, "C: create(8, 0) node-set-only cache succeeds");
+    s = beta_param_cache_compute_radius_grid(
+            lean, params.data(), static_cast<int>(params.size()),
+            radii.data(), static_cast<int>(buf.size()), buf.data());
+    check(s == BETA_PARAM_ERROR_NO_UNIFORM_GRID,
+          "C: uniform entry point on node-set-only cache -> code 10");
+    check(buf[0] != '\0', "C: NO_UNIFORM_GRID message is non-empty");
+    beta_param_cache_destroy(lean);
+
     // --- C++ wrapper ---
     bool threw = false;
     try {
@@ -97,6 +109,9 @@ int main() {
         threw = true;
     }
     check(threw, "hpp: constructor throws on invalid max_beta_params");
+
+    beta_param::Cache lean_cxx{8};
+    check(lean_cxx.n_grid() == 0, "C++: single-arg Cache reports n_grid 0");
 
     // Same max as the cache4 result held in `radii` — parity is per-max (see above).
     beta_param::Cache cxx(4, 181);
