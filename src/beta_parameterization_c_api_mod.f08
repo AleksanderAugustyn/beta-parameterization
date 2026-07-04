@@ -248,7 +248,7 @@ contains
 
     function beta_param_cache_resolve_shape( &
             handle, params, n_params, beta_con, corrected_beta10, &
-            r_north, r_south, message_buf_len, message_buf) &
+            r_north, r_south, apply_com_correction, message_buf_len, message_buf) &
             result(status) bind(c, name='beta_param_cache_resolve_shape')
 
         type(c_ptr),              intent(in), value :: handle
@@ -258,6 +258,7 @@ contains
         real(kind = rk_c),        intent(out)       :: corrected_beta10
         real(kind = rk_c),        intent(out)       :: r_north
         real(kind = rk_c),        intent(out)       :: r_south
+        integer(kind = ik_c),     intent(in), value :: apply_com_correction
         integer(kind = ik_c),     intent(in), value :: message_buf_len
         character(kind = c_char), intent(out)       :: message_buf(message_buf_len)
         integer(kind = ik_c) :: status
@@ -287,7 +288,8 @@ contains
 
         call cache_ptr%resolve_shape( &
                 f_params, f_beta_con, f_corrected, f_r_north, f_r_south, &
-                error_code, f_message)
+                error_code, f_message, &
+                apply_com_correction = (apply_com_correction /= 0_ik_c))
 
         beta_con(1:max_params_local) = real(f_beta_con(:), rk_c)
         corrected_beta10 = real(f_corrected, rk_c)

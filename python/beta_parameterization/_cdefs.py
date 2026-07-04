@@ -48,7 +48,7 @@ def configure(lib: ctypes.CDLL) -> ctypes.CDLL:
     lib.beta_param_cache_resolve_shape.argtypes = [
         ctypes.c_void_p, c_dbl_p, ctypes.c_int,
         c_dbl_p, c_dbl_p, c_dbl_p, c_dbl_p,
-        ctypes.c_int, ctypes.c_char_p]
+        ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
     lib.beta_param_cache_resolve_shape.restype = ctypes.c_int
 
     lib.beta_param_cache_compute_radius_and_derivative.argtypes = [
