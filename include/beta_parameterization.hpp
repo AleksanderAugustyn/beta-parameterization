@@ -60,6 +60,11 @@ public:
         }
     }
 
+    /** Node-set-only cache: uniform-grid entry points return
+     *  BETA_PARAM_ERROR_NO_UNIFORM_GRID (the wrapper's own size check
+     *  rejects non-empty buffers first, since n_grid() == 0). */
+    explicit Cache(int max_beta_params) : Cache(max_beta_params, 0) {}
+
     Cache(const Cache&)            = delete;
     Cache& operator=(const Cache&) = delete;
 
