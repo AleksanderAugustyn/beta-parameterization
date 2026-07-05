@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
 project(beta-parameterization
-        VERSION 2.3.1
+        VERSION 2.3.2
         LANGUAGES Fortran CXX
         DESCRIPTION "Beta parameterization for nuclear physics applications"
 )
