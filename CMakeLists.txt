@@ -100,8 +100,14 @@ target_compile_features(beta_parameterization_cxx INTERFACE cxx_std_20)
 add_library(BetaParameterization::beta_parameterization_cxx
         ALIAS beta_parameterization_cxx)
 
-# --- Tests ---
-enable_testing()
+# --- Install the shared library into the Python package (wheel builds) ---
+install(TARGETS beta_parameterization_shared
+        LIBRARY DESTINATION beta_parameterization)
+
+# --- Tests (skipped for wheel builds via -DBETA_PARAM_BUILD_TESTS=OFF) ---
+option(BETA_PARAM_BUILD_TESTS "Build the Fortran/C++ test suite" ON)
+if (BETA_PARAM_BUILD_TESTS)
+    enable_testing()
 
 add_library(beta_param_test_utils STATIC tests/test_utils_mod.f08)
 target_link_libraries(beta_param_test_utils
@@ -142,3 +148,5 @@ find_package(Threads REQUIRED)
 add_executable(thread_stress_test tests/thread_stress_test.cpp)
 target_link_libraries(thread_stress_test PRIVATE beta_parameterization_cxx Threads::Threads)
 add_test(NAME thread_stress COMMAND thread_stress_test)
+
+endif ()
