@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
 project(beta-parameterization
-        VERSION 2.3.2
+        VERSION 2.3.3
         LANGUAGES Fortran CXX
         DESCRIPTION "Beta parameterization for nuclear physics applications"
 )
@@ -16,7 +16,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 FetchContent_Declare(
         GCC-Compiler-Options
         GIT_REPOSITORY https://github.com/AleksanderAugustyn/GCC-Compiler-Options.git
-        GIT_TAG 1.5.0
+        GIT_TAG 1.6.0
 )
 FetchContent_MakeAvailable(GCC-Compiler-Options)
 
