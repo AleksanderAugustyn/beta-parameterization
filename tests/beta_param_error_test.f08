@@ -90,7 +90,8 @@ contains
             do j = 0_ik, 6_ik
                 b1 = real(i, rk) * 0.25_rk
                 b3 = real(j, rk) * 0.25_rk
-                params = [b1, 0.5_rk, b3, 0.0_rk]
+                params(1) = b1; params(2) = 0.5_rk
+                params(3) = b3; params(4) = 0.0_rk
                 call cache%compute_radius_grid_with_com_shift(params, radii, corrected, c, msg)
                 if (c == LEGENDRE_ERROR_COM_NOT_CONVERGED) n_hit = n_hit + 1_ik
             end do

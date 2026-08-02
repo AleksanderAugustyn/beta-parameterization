@@ -73,7 +73,11 @@ contains
         call cache%compute_radius_and_derivative(beta_con, node_set, radii, dr, c, msg)
         call assert_int_eq(c, LEGENDRE_VALID, name // ': evaluated')
 
-        values = [corrected_beta10, r_north, r_south, radii, dr]
+        values(1)   = corrected_beta10
+        values(2)   = r_north
+        values(3)   = r_south
+        values(4:6) = radii
+        values(7:9) = dr
         write(*, '(A,A,A)') 'real(kind = rk), parameter :: ', name, '_NODE_SET_EXPECTED(9) = [ &'
         do i = 1_ik, 8_ik
             write(*, '(A,ES24.16E3,A)') '        ', values(i), '_rk, &'

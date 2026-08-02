@@ -45,12 +45,13 @@ contains
 
         call cache%init(2_ik, N_GRID, code, message)
         beta_star = 2.0_rk / n2
+        params(1) = 0.0_rk
 
-        params = [0.0_rk, beta_star * (1.0_rk - 1.0e-3_rk)]
+        params(2) = beta_star * (1.0_rk - 1.0e-3_rk)
         call cache%compute_radius_grid(params, radii, code, message)
         call assert_int_eq(code, LEGENDRE_VALID, 'breakdown: 0.999 beta* valid')
 
-        params = [0.0_rk, beta_star * (1.0_rk + 1.0e-3_rk)]
+        params(2) = beta_star * (1.0_rk + 1.0e-3_rk)
         call cache%compute_radius_grid(params, radii, code, message)
         call assert_int_eq(code, LEGENDRE_ERROR_INTERIOR_NEGATIVE, &
                 'breakdown: 1.001 beta* rejected as interior-negative')
@@ -65,12 +66,13 @@ contains
 
         call cache%init(2_ik, N_GRID, code, message)
         beta_pole = -1.0_rk / n2
+        params(1) = 0.0_rk
 
-        params = [0.0_rk, beta_pole * (1.0_rk - 1.0e-3_rk)]
+        params(2) = beta_pole * (1.0_rk - 1.0e-3_rk)
         call cache%compute_radius_grid(params, radii, code, message)
         call assert_int_eq(code, LEGENDRE_VALID, 'breakdown: 0.999 pole crossing valid')
 
-        params = [0.0_rk, beta_pole * (1.0_rk + 1.0e-3_rk)]
+        params(2) = beta_pole * (1.0_rk + 1.0e-3_rk)
         call cache%compute_radius_grid(params, radii, code, message)
         call assert_true(code == LEGENDRE_ERROR_NORTH_POLE .or. code == LEGENDRE_ERROR_SOUTH_POLE, &
                 'breakdown: 1.001 pole crossing rejected as pole error')
@@ -93,7 +95,8 @@ contains
         n_valid = 0_ik
 
         do k = -30_ik, 30_ik
-            params = [0.0_rk, real(k, rk) * 0.1_rk]
+            params(1) = 0.0_rk
+            params(2) = real(k, rk) * 0.1_rk
             call cache%compute_radius_grid(params, radii, code, message)
             if (code /= LEGENDRE_VALID) cycle
             n_valid = n_valid + 1_ik
