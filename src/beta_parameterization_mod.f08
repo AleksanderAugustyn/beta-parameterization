@@ -35,6 +35,12 @@ module beta_parameterization_mod
     use mathematical_utilities_mod, only: &
             compute_spherical_harmonics_normalization_constants_s, &
             compute_gauss_legendre_quadrature_s
+    use shape_core_mod, only: &
+            SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS, &
+            SHAPE_ERROR_CACHE_NOT_INITIALIZED, SHAPE_ERROR_INVALID_GRID, &
+            SHAPE_ERROR_WRONG_PARAM_COUNT, SHAPE_ERROR_INVALID_INIT, &
+            SHAPE_ERROR_TABLES_NOT_INITIALIZED, &
+            SHAPE_CACHE_MAX_PARAMS, SHAPE_STANDALONE_MAX_PARAMS
     use beta_parameterization_workers_mod, only: &
             precompute_legendre_table_s, &
             precompute_legendre_derivative_table_s, &
@@ -78,6 +84,25 @@ module beta_parameterization_mod
     integer(kind = ik), parameter, public :: LEGENDRE_ERROR_INVALID_BUFFER_SIZE = 8_ik
     integer(kind = ik), parameter, public :: LEGENDRE_ERROR_POLE_NODE          = 9_ik
     integer(kind = ik), parameter, public :: LEGENDRE_ERROR_NO_UNIFORM_GRID    = 10_ik
+
+    ! Shared contract codes re-exported for consumers
+    public :: SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS
+    public :: SHAPE_ERROR_CACHE_NOT_INITIALIZED, SHAPE_ERROR_INVALID_GRID
+    public :: SHAPE_ERROR_WRONG_PARAM_COUNT, SHAPE_ERROR_INVALID_INIT
+    public :: SHAPE_ERROR_TABLES_NOT_INITIALIZED
+    public :: SHAPE_CACHE_MAX_PARAMS, SHAPE_STANDALONE_MAX_PARAMS
+
+    ! Library codes (contract range >= 100, append-only after 3.0.0)
+    integer(kind = ik), parameter, public :: BETA_PARAM_ERROR_NORTH_POLE          = 100_ik
+    integer(kind = ik), parameter, public :: BETA_PARAM_ERROR_SOUTH_POLE          = 101_ik
+    integer(kind = ik), parameter, public :: BETA_PARAM_ERROR_INTERIOR_NEGATIVE   = 102_ik
+    integer(kind = ik), parameter, public :: BETA_PARAM_ERROR_COM_NOT_CONVERGED   = 103_ik
+    integer(kind = ik), parameter, public :: BETA_PARAM_ERROR_INVALID_BUFFER_SIZE = 104_ik
+    integer(kind = ik), parameter, public :: BETA_PARAM_ERROR_POLE_NODE           = 105_ik
+    integer(kind = ik), parameter, public :: BETA_PARAM_ERROR_NODE_SET_MISMATCH   = 106_ik
+
+    integer(kind = ik), parameter, public :: STATUS_MESSAGE_LEN = 64_ik
+    public :: status_message_f
 
     !---------------------------------------------------------------------------
     ! Validation thresholds (policy — workers compute, API decides)
@@ -144,6 +169,29 @@ module beta_parameterization_mod
     end type node_set_t
 
 contains
+
+    !> Fixed diagnostic string for a status code (spec 3.5).
+    pure function status_message_f(status) result(msg)
+        integer(kind = ik), intent(in) :: status
+        character(len = STATUS_MESSAGE_LEN) :: msg
+        select case (status)
+        case (SHAPE_VALID);                          msg = 'valid'
+        case (SHAPE_ERROR_TOO_MANY_PARAMS);          msg = 'too many parameters for this tier'
+        case (SHAPE_ERROR_CACHE_NOT_INITIALIZED);    msg = 'cache not initialized'
+        case (SHAPE_ERROR_INVALID_GRID);             msg = 'theta grid below minimum size (2)'
+        case (SHAPE_ERROR_WRONG_PARAM_COUNT);        msg = 'params length differs from n_params'
+        case (SHAPE_ERROR_INVALID_INIT);             msg = 'invalid init arguments'
+        case (SHAPE_ERROR_TABLES_NOT_INITIALIZED);   msg = 'tables not initialized'
+        case (BETA_PARAM_ERROR_NORTH_POLE);          msg = 'north pole radius not positive'
+        case (BETA_PARAM_ERROR_SOUTH_POLE);          msg = 'south pole radius not positive'
+        case (BETA_PARAM_ERROR_INTERIOR_NEGATIVE);   msg = 'interior radius not positive'
+        case (BETA_PARAM_ERROR_COM_NOT_CONVERGED);   msg = 'COM correction did not converge'
+        case (BETA_PARAM_ERROR_INVALID_BUFFER_SIZE); msg = 'output buffer size mismatch'
+        case (BETA_PARAM_ERROR_POLE_NODE);           msg = 'theta at or beyond a pole'
+        case (BETA_PARAM_ERROR_NODE_SET_MISMATCH);   msg = 'node set unbuilt or max_l too small'
+        case default;                                msg = 'unknown status code'
+        end select
+    end function status_message_f
 
     !===========================================================================
     ! LIFECYCLE
