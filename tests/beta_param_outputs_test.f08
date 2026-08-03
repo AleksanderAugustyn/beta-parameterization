@@ -20,7 +20,10 @@ program beta_param_outputs_test
     type(tables_t) :: tables_small
     type(node_set_t) :: nodes, nodes_small
     integer(kind = ik) :: status, i
-    real(kind = rk) :: thetas(16), params(4), radii(16), drs(16), bad(5)
+    ! bad/bad2 are two distinct undersized buffers: a call taking both radii and
+    ! dr_dthetas needs separate actual arguments (two intent(out) dummies must
+    ! not be aliased, F2018 15.5.2.13)
+    real(kind = rk) :: thetas(16), params(4), radii(16), drs(16), bad(5), bad2(5)
     real(kind = rk) :: node_radii(16), node_drs(16)
     real(kind = rk) :: norms(4), p(5), expected, b10, rn, rs, vf
 
@@ -77,7 +80,7 @@ program beta_param_outputs_test
 
     ! buffers are checked against the node count, before the node-set check
     call cache_node_radius_and_derivative_s(cache, nodes, params, bad(1:5), &
-            bad(1:5), status)
+            bad2(1:5), status)
     call assert_int_eq(status, BETA_PARAM_ERROR_INVALID_BUFFER_SIZE, &
             'node buffers sized to the node count')
 

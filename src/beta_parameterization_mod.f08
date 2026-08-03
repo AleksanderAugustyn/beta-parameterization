@@ -15,6 +15,14 @@
 !! Every entry point reports through the shared status contract
 !! (`SHAPE_*` codes, library codes >= 100); none of them stop.
 !!
+!! ## Precondition: finite input
+!!
+!! `params` (and every theta) must be finite. Non-finite input is UNDEFINED
+!! BEHAVIOR — the library cannot detect NaN under fast-math, so the validity
+!! gate (`r_north <= threshold` and friends) silently passes and the call
+!! returns `SHAPE_VALID` (0) with NaN outputs. No runtime NaN check exists on
+!! any path; screen inputs before calling.
+!!
 !! ## Thread model (BREAKING CHANGE at 3.0.0)
 !!
 !! The 2.x promise — cache immutable after creation, concurrent computes on one

@@ -28,6 +28,13 @@ across an OpenMP region **must** hoist a per-thread cache; the old code will
 race silently. C++ `Cache` compute methods are no longer `const` — the compiler
 catches most of these at the call site.
 
+**Fortran callers of `cache_init_shared_s` MUST declare their `tables_t` with
+the `target` attribute.** The cache stores a pointer to it, and a pointer
+associated with a non-target dummy becomes undefined when that procedure
+returns (F2018 8.5.17). Without `target` the code compiles, links and usually
+appears to work — then reads freed memory. Declare
+`type(tables_t), target :: tables`.
+
 ### Added
 
 - **In-library volume conservation.** `conserve_volume` is a cache/standalone
@@ -67,8 +74,9 @@ catches most of these at the call site.
 - **BREAKING: the cached tier now caps `n_params` at 8, down from 64.** A cache
   carries the recompute engine, whose per-intermediate dependency masks are
   fixed-width, so `shape_core`'s `SHAPE_CACHE_MAX_PARAMS` = 8 is the hard limit.
-  `cache_init_s` / `cache_init_shared_s` reject `n_params` outside `1..8` with
-  `SHAPE_ERROR_TOO_MANY_PARAMS` (1) — the engine check runs before any table is
+  `cache_init_s` / `cache_init_shared_s` reject `n_params > 8` with
+  `SHAPE_ERROR_TOO_MANY_PARAMS` (1) and `n_params < 1` with
+  `SHAPE_ERROR_INVALID_INIT` (5) — the engine check runs before any table is
   built, so nothing is allocated. **The standalone tier is unaffected and still
   accepts up to 64** (`SHAPE_STANDALONE_MAX_PARAMS`): it constructs no engine.
   2.x accepted `max_beta_params` up to 64 for the cache, so any consumer that

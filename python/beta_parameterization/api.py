@@ -194,6 +194,13 @@ def radius_grid(params: npt.ArrayLike, thetas: npt.ArrayLike,
     -------
     RadiusGridResult
         Radii and status; radii are zero-filled on failure.
+
+    Notes
+    -----
+    ``params`` and ``thetas`` must be finite. Non-finite input is undefined
+    behavior: the library cannot detect NaN under fast-math, so the call
+    returns ``Status.VALID`` with NaN radii instead of an error. Screen inputs
+    before calling.
     """
     p = _as_1d(params, "params")
     t = _as_1d(thetas, "thetas")
@@ -261,6 +268,13 @@ class Cache:
     ------
     BetaParamError
         If the library rejects the arguments; the message carries the status.
+
+    Notes
+    -----
+    Every ``params`` array (and ``thetas``) must be finite. Non-finite input is
+    undefined behavior: the library cannot detect NaN under fast-math, so
+    compute calls return ``Status.VALID`` with NaN outputs instead of an error.
+    Screen inputs before calling.
     """
 
     def __init__(self, n_params: int, thetas: npt.ArrayLike,

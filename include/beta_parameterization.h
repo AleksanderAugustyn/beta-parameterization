@@ -46,6 +46,12 @@
  *   recomputes from scratch. No partially updated results are ever visible.
  *   A NULL handle passed into a compute function returns
  *   BETA_PARAM_ERROR_CACHE_NOT_INITIALIZED (2).
+ *
+ * Precondition — finite input:
+ *   `params` and `thetas` must be finite. Non-finite input is undefined
+ *   behavior: the library cannot detect NaN under fast-math, so validation
+ *   comparisons silently pass and the call returns BETA_PARAM_VALID (0) with
+ *   NaN outputs. Screen inputs before calling.
  */
 
 #ifndef BETA_PARAMETERIZATION_H
