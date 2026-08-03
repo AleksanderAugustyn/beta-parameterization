@@ -70,6 +70,12 @@ module beta_parameterization_mod
     public :: cache_radius_grid_unchecked_s
 
     !---------------------------------------------------------------------------
+    ! Standalone computes (tier 1: no cache, no engine, nothing to free)
+    !---------------------------------------------------------------------------
+    public :: compute_radius_grid_standalone_s
+    public :: compute_radius_and_derivative_standalone_s
+
+    !---------------------------------------------------------------------------
     ! Public limits
     !---------------------------------------------------------------------------
     integer(kind = ik), parameter, public :: MAX_BETA_PARAMS_LIMIT = 64_ik
@@ -591,6 +597,138 @@ contains
     end function cache_is_initialized_f
 
     !===========================================================================
+    ! SHARED COMPUTE CORES (tables + plain arrays, no cache, no engine)
+    !===========================================================================
+    !
+    ! The cached pipeline and the tier-1 standalone entries run the SAME code
+    ! here — one implementation, so the two paths agree bit for bit. Nothing in
+    ! this section knows about `cache_t`.
+
+    !> Normalize the parameters, optionally COM-correct them, take the poles.
+    !!
+    !! @param[in]    tables            Initialized tables (norms + GL data)
+    !! @param[in]    apply_com         Apply the centre-of-mass correction
+    !! @param[inout] beta_local        Parameters in, COM-corrected values out
+    !! @param[out]   beta_con          beta_local(k) x norm_constants(k)
+    !! @param[out]   corrected_beta10  beta_local(1) after the correction
+    !! @param[out]   r_north           R(theta = 0), UNSCALED
+    !! @param[out]   r_south           R(theta = pi), UNSCALED
+    !! @param[out]   status            SHAPE_VALID or BETA_PARAM_ERROR_COM_NOT_CONVERGED
+    subroutine resolve_core_s(tables, apply_com, beta_local, beta_con, &
+            corrected_beta10, r_north, r_south, status)
+        type(tables_t),     intent(in)    :: tables
+        logical,            intent(in)    :: apply_com
+        real(kind = rk),    intent(inout) :: beta_local(:)
+        real(kind = rk),    intent(out)   :: beta_con(:)
+        real(kind = rk),    intent(out)   :: corrected_beta10, r_north, r_south
+        integer(kind = ik), intent(out)   :: status
+
+        integer(kind = ik) :: n, n_iter
+        logical            :: converged
+
+        status           = SHAPE_VALID
+        corrected_beta10 = 0.0_rk
+        r_north          = 0.0_rk
+        r_south          = 0.0_rk
+        n = size(beta_local, kind = ik)
+
+        beta_con(:) = beta_local(:) * tables%norm_constants(1:n)
+
+        if (apply_com) then
+            call newton_com_correction_s(beta_local, beta_con, &
+                    tables%norm_constants(1:n), tables%gl_nodes, &
+                    tables%gl_weights, tables%legendre_gl, converged, n_iter)
+            if (.not. converged) then
+                status = BETA_PARAM_ERROR_COM_NOT_CONVERGED
+                return
+            end if
+        end if
+
+        corrected_beta10 = beta_local(1)
+        call eval_polar_radii_s(beta_con, r_north, r_south)
+    end subroutine resolve_core_s
+
+    !> Reject shapes whose radius is not positive everywhere.
+    !!
+    !! Poles come from the analytic values `resolve_core_s` produced; the
+    !! interior is scanned on the Gauss-Legendre grid, which is DESCENDING in
+    !! x — index 1 is x ~ +1 (theta ~ 0, north) and index N_QUAD is x ~ -1
+    !! (theta ~ pi, south), so a minimum at either end is attributed to that pole.
+    !!
+    !! Every value here is unscaled: the volume factor is positive, so it cannot
+    !! change any sign the check looks at.
+    !!
+    !! @param[in]  tables   Initialized tables (GL nodes + Legendre table)
+    !! @param[in]  beta_con Resolved beta x norm products
+    !! @param[in]  r_north  Unscaled north pole radius
+    !! @param[in]  r_south  Unscaled south pole radius
+    !! @param[out] r_min    Smallest radius on the GL grid (0 when a pole fails)
+    !! @param[out] i_min    Its GL index (0 when a pole fails)
+    !! @param[out] status   SHAPE_VALID or the rejecting BETA_PARAM_ERROR_* code
+    subroutine validate_core_s(tables, beta_con, r_north, r_south, r_min, i_min, status)
+        type(tables_t),     intent(in)  :: tables
+        real(kind = rk),    intent(in)  :: beta_con(:)
+        real(kind = rk),    intent(in)  :: r_north, r_south
+        real(kind = rk),    intent(out) :: r_min
+        integer(kind = ik), intent(out) :: i_min
+        integer(kind = ik), intent(out) :: status
+
+        real(kind = rk) :: r_gl(N_QUAD)
+
+        status = SHAPE_VALID
+        r_min  = 0.0_rk
+        i_min  = 0_ik
+        if (r_north <= R_MIN_THRESHOLD) then
+            status = BETA_PARAM_ERROR_NORTH_POLE
+            return
+        end if
+        if (r_south <= R_MIN_THRESHOLD) then
+            status = BETA_PARAM_ERROR_SOUTH_POLE
+            return
+        end if
+
+        call eval_radius_grid_s(beta_con, tables%legendre_gl, r_gl)
+        call find_min_radius_s(r_gl, r_min, i_min)
+
+        if (r_min <= R_MIN_THRESHOLD) then
+            if (i_min == 1_ik) then
+                status = BETA_PARAM_ERROR_NORTH_POLE
+            else if (i_min == N_QUAD) then
+                status = BETA_PARAM_ERROR_SOUTH_POLE
+            else
+                status = BETA_PARAM_ERROR_INTERIOR_NEGATIVE
+            end if
+        end if
+    end subroutine validate_core_s
+
+    !> The radial scale that restores the unit-sphere volume, or 1.
+    !!
+    !! Infallible — `validate_core_s` has already guaranteed R > 0 everywhere,
+    !! so the volume integral is positive and the cube root is real.
+    !!
+    !! @param[in]  tables           Initialized tables (GL data)
+    !! @param[in]  beta_con         Resolved beta x norm products
+    !! @param[in]  conserve_volume  .false. yields a factor of exactly 1
+    !! @param[out] volume_factor    (2 / volume_integral)^(1/3), or 1
+    subroutine volume_core_s(tables, beta_con, conserve_volume, volume_factor)
+        type(tables_t),  intent(in)  :: tables
+        real(kind = rk), intent(in)  :: beta_con(:)
+        logical,         intent(in)  :: conserve_volume
+        real(kind = rk), intent(out) :: volume_factor
+
+        real(kind = rk) :: volume_integral, z_mean_integral
+
+        if (conserve_volume) then
+            call compute_com_integrals_s(beta_con, tables%gl_nodes, &
+                    tables%gl_weights, tables%legendre_gl, &
+                    volume_integral, z_mean_integral)
+            volume_factor = (2.0_rk / volume_integral)**(1.0_rk / 3.0_rk)
+        else
+            volume_factor = 1.0_rk
+        end if
+    end subroutine volume_core_s
+
+    !===========================================================================
     ! CACHED INTERMEDIATES
     !===========================================================================
 
@@ -605,88 +743,33 @@ contains
         real(kind = rk),    intent(in)    :: params(:)
         integer(kind = ik), intent(out)   :: status
 
-        integer(kind = ik) :: n, n_iter
-        logical            :: converged
+        integer(kind = ik) :: n
 
-        status = SHAPE_VALID
         n = cache%n_params
-
         cache%beta_local(1:n) = params(1:n)
-        cache%beta_con(1:n)   = cache%beta_local(1:n) * cache%tp%norm_constants(1:n)
-
-        if (cache%apply_com) then
-            call newton_com_correction_s(cache%beta_local(1:n), cache%beta_con(1:n), &
-                    cache%tp%norm_constants(1:n), cache%tp%gl_nodes, &
-                    cache%tp%gl_weights, cache%tp%legendre_gl, converged, n_iter)
-            if (.not. converged) then
-                status = BETA_PARAM_ERROR_COM_NOT_CONVERGED
-                return
-            end if
-        end if
-
-        cache%corrected_beta10 = cache%beta_local(1)
-        call eval_polar_radii_s(cache%beta_con(1:n), cache%r_north, cache%r_south)
+        call resolve_core_s(cache%tp, cache%apply_com, cache%beta_local(1:n), &
+                cache%beta_con(1:n), cache%corrected_beta10, cache%r_north, &
+                cache%r_south, status)
     end subroutine do_resolve_s
 
     !> I_MIN_RADIUS: reject shapes whose radius is not positive everywhere.
-    !!
-    !! Poles come from the analytic values resolved in `do_resolve_s`; the
-    !! interior is scanned on the Gauss-Legendre grid, which is DESCENDING in
-    !! x — index 1 is x ~ +1 (theta ~ 0, north) and index N_QUAD is x ~ -1
-    !! (theta ~ pi, south), so a minimum at either end is attributed to that pole.
     !!
     !! @param[inout] cache   Initialized, already resolved cache; r_min/i_min written
     !! @param[out]   status  SHAPE_VALID or the rejecting BETA_PARAM_ERROR_* code
     subroutine do_validate_s(cache, status)
         type(cache_t),      intent(inout) :: cache
         integer(kind = ik), intent(out)   :: status
-
-        real(kind = rk) :: r_gl(N_QUAD)
-
-        status = SHAPE_VALID
-        if (cache%r_north <= R_MIN_THRESHOLD) then
-            status = BETA_PARAM_ERROR_NORTH_POLE
-            return
-        end if
-        if (cache%r_south <= R_MIN_THRESHOLD) then
-            status = BETA_PARAM_ERROR_SOUTH_POLE
-            return
-        end if
-
-        call eval_radius_grid_s(cache%beta_con(1:cache%n_params), &
-                cache%tp%legendre_gl, r_gl)
-        call find_min_radius_s(r_gl, cache%r_min, cache%i_min)
-
-        if (cache%r_min <= R_MIN_THRESHOLD) then
-            if (cache%i_min == 1_ik) then
-                status = BETA_PARAM_ERROR_NORTH_POLE
-            else if (cache%i_min == N_QUAD) then
-                status = BETA_PARAM_ERROR_SOUTH_POLE
-            else
-                status = BETA_PARAM_ERROR_INTERIOR_NEGATIVE
-            end if
-        end if
+        call validate_core_s(cache%tp, cache%beta_con(1:cache%n_params), &
+                cache%r_north, cache%r_south, cache%r_min, cache%i_min, status)
     end subroutine do_validate_s
 
     !> I_VOLUME: the radial scale that restores the unit-sphere volume.
     !!
-    !! Infallible — `do_validate_s` has already guaranteed R > 0 everywhere, so
-    !! the volume integral is positive and the cube root is real.
-    !!
     !! @param[inout] cache  Initialized, already validated cache; volume_factor written
     subroutine do_volume_s(cache)
         type(cache_t), intent(inout) :: cache
-
-        real(kind = rk) :: volume_integral, z_mean_integral
-
-        if (cache%conserve_volume) then
-            call compute_com_integrals_s(cache%beta_con(1:cache%n_params), &
-                    cache%tp%gl_nodes, cache%tp%gl_weights, cache%tp%legendre_gl, &
-                    volume_integral, z_mean_integral)
-            cache%volume_factor = (2.0_rk / volume_integral)**(1.0_rk / 3.0_rk)
-        else
-            cache%volume_factor = 1.0_rk
-        end if
+        call volume_core_s(cache%tp, cache%beta_con(1:cache%n_params), &
+                cache%conserve_volume, cache%volume_factor)
     end subroutine do_volume_s
 
     !> I_RADII: R(theta) on the primary theta grid, cached already scaled.
@@ -1031,5 +1114,180 @@ contains
         call eval_radius_grid_s(cache%beta_con(1:cache%n_params), &
                 cache%tp%legendre_primary, radii)
     end subroutine cache_radius_grid_unchecked_s
+
+    !===========================================================================
+    ! STANDALONE COMPUTES (TIER 1)
+    !===========================================================================
+
+    !> Build throwaway tables and run resolve -> validate -> volume on them.
+    !!
+    !! The whole tier-1 pipeline except the final table evaluation, which is the
+    !! only part the two standalone entries do not share. The caller owns
+    !! `tables` and MUST call `tables_free_s` on it on every path, success or
+    !! failure; a failed `tables_init_s` already leaves the default state, so
+    !! freeing then is a no-op.
+    !!
+    !! @param[out] tables           Built here, freed by the caller
+    !! @param[in]  params           Parameter vector, 1 <= size <= tier-1 cap
+    !! @param[in]  thetas           Theta nodes (radians), at least 2, none polar
+    !! @param[in]  conserve_volume  Renormalize radii to fixed volume
+    !! @param[in]  apply_com        Apply the centre-of-mass correction
+    !! @param[out] beta_con         Resolved beta x norm products (allocated here)
+    !! @param[out] volume_factor    Radial scale (1 when volume is not conserved)
+    !! @param[out] status           SHAPE_VALID on success, else the rejecting code
+    subroutine standalone_prepare_s(tables, params, thetas, conserve_volume, &
+            apply_com, beta_con, volume_factor, status)
+        type(tables_t),               intent(out) :: tables
+        real(kind = rk),              intent(in)  :: params(:)
+        real(kind = rk),              intent(in)  :: thetas(:)
+        logical,                      intent(in)  :: conserve_volume, apply_com
+        real(kind = rk), allocatable, intent(out) :: beta_con(:)
+        real(kind = rk),              intent(out) :: volume_factor
+        integer(kind = ik),           intent(out) :: status
+
+        real(kind = rk), allocatable :: beta_local(:)
+        real(kind = rk)    :: corrected_beta10, r_north, r_south, r_min
+        integer(kind = ik) :: n_params, i_min
+
+        volume_factor = 1.0_rk
+        n_params = size(params, kind = ik)
+
+        ! tables_init_s owns the theta-set contract (3 / 105).
+        call tables_init_s(tables, n_params, thetas, status)
+        if (status /= SHAPE_VALID) return
+
+        allocate(beta_local(n_params), beta_con(n_params))
+        beta_local(:) = params(:)
+
+        call resolve_core_s(tables, apply_com, beta_local, beta_con, &
+                corrected_beta10, r_north, r_south, status)
+        if (status /= SHAPE_VALID) return
+        call validate_core_s(tables, beta_con, r_north, r_south, r_min, i_min, status)
+        if (status /= SHAPE_VALID) return
+        call volume_core_s(tables, beta_con, conserve_volume, volume_factor)
+    end subroutine standalone_prepare_s
+
+    !> R(theta) on a caller-supplied theta set, with nothing kept between calls.
+    !!
+    !! Everything the cached path stores is built here and thrown away, so the
+    !! cost is one full pipeline per call — use a `cache_t` for repeated
+    !! evaluations. The results are identical to the cached ones bit for bit:
+    !! both paths run the same cores over the same tables.
+    !!
+    !! Tier 1 accepts up to `SHAPE_STANDALONE_MAX_PARAMS` parameters (the cache
+    !! cap is lower). Every failure zero-fills `radii`.
+    !!
+    !! @param[in]  params           Parameter vector; its length sets max_l
+    !! @param[in]  thetas           Theta nodes (radians), at least 2, none polar
+    !! @param[in]  conserve_volume  Renormalize radii to fixed volume
+    !! @param[in]  apply_com        Apply the centre-of-mass correction
+    !! @param[out] radii            R(theta_i) x volume_factor; size == size(thetas)
+    !! @param[out] status           SHAPE_VALID on success, else the rejecting code
+    subroutine compute_radius_grid_standalone_s(params, thetas, conserve_volume, &
+            apply_com, radii, status)
+        real(kind = rk),    intent(in)  :: params(:)
+        real(kind = rk),    intent(in)  :: thetas(:)
+        logical,            intent(in)  :: conserve_volume
+        logical,            intent(in)  :: apply_com
+        real(kind = rk),    intent(out) :: radii(:)
+        integer(kind = ik), intent(out) :: status
+
+        type(tables_t) :: tables
+        real(kind = rk), allocatable :: beta_con(:)
+        real(kind = rk)    :: volume_factor
+        integer(kind = ik) :: n_params
+
+        radii(:) = 0.0_rk
+        status   = SHAPE_VALID
+
+        ! Cheap contract checks first: nothing is built until they all pass.
+        n_params = size(params, kind = ik)
+        if (n_params < 1_ik) then
+            status = SHAPE_ERROR_INVALID_INIT
+            return
+        end if
+        if (n_params > SHAPE_STANDALONE_MAX_PARAMS) then
+            status = SHAPE_ERROR_TOO_MANY_PARAMS
+            return
+        end if
+        if (size(radii, kind = ik) /= size(thetas, kind = ik)) then
+            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
+            return
+        end if
+
+        call standalone_prepare_s(tables, params, thetas, conserve_volume, &
+                apply_com, beta_con, volume_factor, status)
+        if (status /= SHAPE_VALID) then
+            call tables_free_s(tables)
+            return          ! radii already zero-filled
+        end if
+
+        call eval_radius_grid_s(beta_con, tables%legendre_primary, radii)
+        radii(:) = radii(:) * volume_factor
+        call tables_free_s(tables)
+    end subroutine compute_radius_grid_standalone_s
+
+    !> R(theta) and dR/dtheta on a caller-supplied theta set, nothing kept.
+    !!
+    !! The derivative twin of `compute_radius_grid_standalone_s`: same contract,
+    !! same cores, both buffers checked before anything is built and both
+    !! zero-filled on every failure.
+    !!
+    !! @param[in]  params           Parameter vector; its length sets max_l
+    !! @param[in]  thetas           Theta nodes (radians), at least 2, none polar
+    !! @param[in]  conserve_volume  Renormalize radii to fixed volume
+    !! @param[in]  apply_com        Apply the centre-of-mass correction
+    !! @param[out] radii            R(theta_i) x volume_factor; size == size(thetas)
+    !! @param[out] dr_dthetas       dR/dtheta at theta_i x volume_factor; same size
+    !! @param[out] status           SHAPE_VALID on success, else the rejecting code
+    subroutine compute_radius_and_derivative_standalone_s(params, thetas, &
+            conserve_volume, apply_com, radii, dr_dthetas, status)
+        real(kind = rk),    intent(in)  :: params(:)
+        real(kind = rk),    intent(in)  :: thetas(:)
+        logical,            intent(in)  :: conserve_volume
+        logical,            intent(in)  :: apply_com
+        real(kind = rk),    intent(out) :: radii(:)
+        real(kind = rk),    intent(out) :: dr_dthetas(:)
+        integer(kind = ik), intent(out) :: status
+
+        type(tables_t) :: tables
+        real(kind = rk), allocatable :: beta_con(:)
+        real(kind = rk)    :: volume_factor
+        integer(kind = ik) :: n_params, n_thetas
+
+        radii(:)      = 0.0_rk
+        dr_dthetas(:) = 0.0_rk
+        status        = SHAPE_VALID
+
+        n_params = size(params, kind = ik)
+        if (n_params < 1_ik) then
+            status = SHAPE_ERROR_INVALID_INIT
+            return
+        end if
+        if (n_params > SHAPE_STANDALONE_MAX_PARAMS) then
+            status = SHAPE_ERROR_TOO_MANY_PARAMS
+            return
+        end if
+        n_thetas = size(thetas, kind = ik)
+        if (size(radii, kind = ik) /= n_thetas .or. &
+                size(dr_dthetas, kind = ik) /= n_thetas) then
+            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
+            return
+        end if
+
+        call standalone_prepare_s(tables, params, thetas, conserve_volume, &
+                apply_com, beta_con, volume_factor, status)
+        if (status /= SHAPE_VALID) then
+            call tables_free_s(tables)
+            return          ! both buffers already zero-filled
+        end if
+
+        call eval_radius_grid_s(beta_con, tables%legendre_primary, radii)
+        call eval_radius_derivative_s(beta_con, tables%legendre_primary_deriv, &
+                tables%sin_thetas, dr_dthetas)
+        radii(:)      = radii(:) * volume_factor
+        dr_dthetas(:) = dr_dthetas(:) * volume_factor
+        call tables_free_s(tables)
+    end subroutine compute_radius_and_derivative_standalone_s
 
 end module beta_parameterization_mod
