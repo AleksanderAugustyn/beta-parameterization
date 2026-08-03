@@ -30,7 +30,8 @@ module beta_parameterization_mod
     use beta_parameterization_workers_mod, only: &
             precompute_legendre_table_s, &
             precompute_legendre_derivative_table_s, &
-            eval_polar_radii_s, eval_radius_grid_s, find_min_radius_s, &
+            eval_polar_radii_s, eval_radius_grid_s, eval_radius_derivative_s, &
+            find_min_radius_s, &
             compute_com_integrals_s, newton_com_correction_s
 
     implicit none
@@ -64,6 +65,7 @@ module beta_parameterization_mod
     ! Cached computes
     !---------------------------------------------------------------------------
     public :: cache_resolve_shape_s
+    public :: cache_radius_grid_s, cache_radius_and_derivative_s
 
     !---------------------------------------------------------------------------
     ! Public limits
@@ -685,18 +687,50 @@ contains
         end if
     end subroutine do_volume_s
 
+    !> I_RADII: R(theta) on the primary theta grid, cached already scaled.
+    !!
+    !! Scaling happens here, not at the copy-out boundary: the engine
+    !! invalidates every intermediate whenever a parameter changes (all masks
+    !! are all-params), so a cached `radii` can never outlive the
+    !! `volume_factor` it was scaled with.
+    !!
+    !! @param[inout] cache  Initialized cache with I_VOLUME up to date
+    subroutine do_radii_s(cache)
+        type(cache_t), intent(inout) :: cache
+        call eval_radius_grid_s(cache%beta_con(1:cache%n_params), &
+                cache%tp%legendre_primary, cache%radii)
+        cache%radii(:) = cache%radii(:) * cache%volume_factor
+    end subroutine do_radii_s
+
+    !> I_DERIV: dR/dtheta on the primary theta grid, cached already scaled.
+    !!
+    !! @param[inout] cache  Initialized cache with I_VOLUME up to date
+    subroutine do_deriv_s(cache)
+        type(cache_t), intent(inout) :: cache
+        call eval_radius_derivative_s(cache%beta_con(1:cache%n_params), &
+                cache%tp%legendre_primary_deriv, cache%tp%sin_thetas, &
+                cache%dr_dthetas)
+        cache%dr_dthetas(:) = cache%dr_dthetas(:) * cache%volume_factor
+    end subroutine do_deriv_s
+
     ! Called AFTER shape_engine_begin_s and the buffer checks (spec precedence:
     ! param-count status 4 must win over buffer status 104, so begin_s runs
     ! first in every public routine; a buffer failure then zero-fills and
     ! invalidates, which wipes the diff state begin_s stored - net effect
     ! identical to the spec's normative order).
     !
+    ! `up_to` is the highest intermediate the caller needs; the stages above it
+    ! are left cold. Minimality is part of the contract - a radius-grid call
+    ! must not compute the derivative table.
+    !
     ! @param[inout] cache   Initialized cache, already through begin_s
     ! @param[in]    params  The same parameter vector begin_s accepted
+    ! @param[in]    up_to   Highest intermediate to bring up to date (I_* index)
     ! @param[out]   status  SHAPE_VALID, or the first failing stage's code
-    subroutine ensure_intermediates_s(cache, params, status)
+    subroutine ensure_intermediates_s(cache, params, up_to, status)
         type(cache_t),      intent(inout) :: cache
         real(kind = rk),    intent(in)    :: params(:)
+        integer(kind = ik), intent(in)    :: up_to
         integer(kind = ik), intent(out)   :: status
         status = SHAPE_VALID
         if (shape_engine_needs_f(cache%engine, I_RESOLVED)) then
@@ -704,14 +738,26 @@ contains
             if (status /= SHAPE_VALID) return
             call shape_engine_note_computed_s(cache%engine, I_RESOLVED)
         end if
+        if (up_to < I_MIN_RADIUS) return
         if (shape_engine_needs_f(cache%engine, I_MIN_RADIUS)) then
             call do_validate_s(cache, status)
             if (status /= SHAPE_VALID) return
             call shape_engine_note_computed_s(cache%engine, I_MIN_RADIUS)
         end if
+        if (up_to < I_VOLUME) return
         if (shape_engine_needs_f(cache%engine, I_VOLUME)) then
             call do_volume_s(cache)
             call shape_engine_note_computed_s(cache%engine, I_VOLUME)
+        end if
+        if (up_to < I_RADII) return
+        if (shape_engine_needs_f(cache%engine, I_RADII)) then
+            call do_radii_s(cache)
+            call shape_engine_note_computed_s(cache%engine, I_RADII)
+        end if
+        if (up_to < I_DERIV) return
+        if (shape_engine_needs_f(cache%engine, I_DERIV)) then
+            call do_deriv_s(cache)
+            call shape_engine_note_computed_s(cache%engine, I_DERIV)
         end if
     end subroutine ensure_intermediates_s
 
@@ -764,7 +810,7 @@ contains
         call shape_engine_begin_s(cache%engine, params, status)
         if (status /= SHAPE_VALID) return
 
-        call ensure_intermediates_s(cache, params, status)
+        call ensure_intermediates_s(cache, params, I_VOLUME, status)
         if (status /= SHAPE_VALID) then
             call fail_invalidate_s(cache)
             return
@@ -775,5 +821,94 @@ contains
         r_north          = cache%r_north * volume_factor
         r_south          = cache%r_south * volume_factor
     end subroutine cache_resolve_shape_s
+
+    !> R(theta) on the cache's primary theta grid, scaled by the volume factor.
+    !!
+    !! Computes intermediates 1-4 only: the derivative table stays cold.
+    !! Every failure zero-fills `radii`; a failure after the engine accepted the
+    !! parameters also returns the engine to cold.
+    !!
+    !! @param[inout] cache   Initialized cache
+    !! @param[in]    params  Parameter vector, length == cache n_params
+    !! @param[out]   radii   R(theta_i) x volume_factor; size == cache n_thetas
+    !! @param[out]   status  SHAPE_VALID on success, else the rejecting code
+    subroutine cache_radius_grid_s(cache, params, radii, status)
+        type(cache_t),      intent(inout) :: cache
+        real(kind = rk),    intent(in)    :: params(:)
+        real(kind = rk),    intent(out)   :: radii(:)
+        integer(kind = ik), intent(out)   :: status
+
+        radii(:) = 0.0_rk
+
+        if (.not. cache%is_initialized) then
+            status = SHAPE_ERROR_CACHE_NOT_INITIALIZED
+            return
+        end if
+
+        ! begin_s self-invalidates on a wrong parameter count, and status 4 must
+        ! win over a bad buffer, so it runs before the size check.
+        call shape_engine_begin_s(cache%engine, params, status)
+        if (status /= SHAPE_VALID) return
+
+        if (size(radii, kind = ik) /= tables_n_thetas_f(cache%tp)) then
+            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
+            call fail_invalidate_s(cache)
+            return
+        end if
+
+        call ensure_intermediates_s(cache, params, I_RADII, status)
+        if (status /= SHAPE_VALID) then
+            call fail_invalidate_s(cache)
+            return
+        end if
+
+        radii(:) = cache%radii(:)
+    end subroutine cache_radius_grid_s
+
+    !> R(theta) and dR/dtheta on the primary theta grid, both volume-scaled.
+    !!
+    !! Computes intermediates 1-5. Both buffers are checked before any compute,
+    !! and every failure zero-fills both.
+    !!
+    !! @param[inout] cache       Initialized cache
+    !! @param[in]    params      Parameter vector, length == cache n_params
+    !! @param[out]   radii       R(theta_i) x volume_factor; size == cache n_thetas
+    !! @param[out]   dr_dthetas  dR/dtheta at theta_i x volume_factor; same size
+    !! @param[out]   status      SHAPE_VALID on success, else the rejecting code
+    subroutine cache_radius_and_derivative_s(cache, params, radii, dr_dthetas, status)
+        type(cache_t),      intent(inout) :: cache
+        real(kind = rk),    intent(in)    :: params(:)
+        real(kind = rk),    intent(out)   :: radii(:), dr_dthetas(:)
+        integer(kind = ik), intent(out)   :: status
+
+        integer(kind = ik) :: n
+
+        radii(:)      = 0.0_rk
+        dr_dthetas(:) = 0.0_rk
+
+        if (.not. cache%is_initialized) then
+            status = SHAPE_ERROR_CACHE_NOT_INITIALIZED
+            return
+        end if
+
+        call shape_engine_begin_s(cache%engine, params, status)
+        if (status /= SHAPE_VALID) return
+
+        n = tables_n_thetas_f(cache%tp)
+        if (size(radii, kind = ik) /= n .or. size(dr_dthetas, kind = ik) /= n) then
+            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
+            call fail_invalidate_s(cache)
+            return
+        end if
+
+        call ensure_intermediates_s(cache, params, I_DERIV, status)
+        if (status /= SHAPE_VALID) then
+            call fail_invalidate_s(cache)
+            return
+        end if
+
+        radii(:)      = cache%radii(:)
+        dr_dthetas(:) = cache%dr_dthetas(:)
+    end subroutine cache_radius_and_derivative_s
 
 end module beta_parameterization_mod
