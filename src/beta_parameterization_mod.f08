@@ -24,10 +24,14 @@ module beta_parameterization_mod
             SHAPE_ERROR_WRONG_PARAM_COUNT, SHAPE_ERROR_INVALID_INIT, &
             SHAPE_ERROR_TABLES_NOT_INITIALIZED, &
             SHAPE_CACHE_MAX_PARAMS, SHAPE_STANDALONE_MAX_PARAMS, &
-            shape_engine_t, shape_engine_init_s
+            shape_engine_t, shape_engine_init_s, shape_engine_begin_s, &
+            shape_engine_needs_f, shape_engine_note_computed_s, &
+            shape_engine_invalidate_all_s
     use beta_parameterization_workers_mod, only: &
             precompute_legendre_table_s, &
-            precompute_legendre_derivative_table_s
+            precompute_legendre_derivative_table_s, &
+            eval_polar_radii_s, eval_radius_grid_s, find_min_radius_s, &
+            compute_com_integrals_s, newton_com_correction_s
 
     implicit none
 
@@ -55,6 +59,11 @@ module beta_parameterization_mod
     !---------------------------------------------------------------------------
     public :: cache_init_s, cache_init_shared_s, cache_free_s
     public :: cache_n_params_f, cache_n_thetas_f, cache_is_initialized_f
+
+    !---------------------------------------------------------------------------
+    ! Cached computes
+    !---------------------------------------------------------------------------
+    public :: cache_resolve_shape_s
 
     !---------------------------------------------------------------------------
     ! Public limits
@@ -576,5 +585,195 @@ contains
         logical :: ok
         ok = cache%is_initialized
     end function cache_is_initialized_f
+
+    !===========================================================================
+    ! CACHED INTERMEDIATES
+    !===========================================================================
+
+    !> I_RESOLVED: store the parameters, apply the COM correction, take the poles.
+    !!
+    !! @param[inout] cache   Initialized cache; beta_local/beta_con/
+    !!                       corrected_beta10/r_north/r_south are written
+    !! @param[in]    params  Parameter vector, length == cache%n_params
+    !! @param[out]   status  SHAPE_VALID or BETA_PARAM_ERROR_COM_NOT_CONVERGED
+    subroutine do_resolve_s(cache, params, status)
+        type(cache_t),      intent(inout) :: cache
+        real(kind = rk),    intent(in)    :: params(:)
+        integer(kind = ik), intent(out)   :: status
+
+        integer(kind = ik) :: n, n_iter
+        logical            :: converged
+
+        status = SHAPE_VALID
+        n = cache%n_params
+
+        cache%beta_local(1:n) = params(1:n)
+        cache%beta_con(1:n)   = cache%beta_local(1:n) * cache%tp%norm_constants(1:n)
+
+        if (cache%apply_com) then
+            call newton_com_correction_s(cache%beta_local(1:n), cache%beta_con(1:n), &
+                    cache%tp%norm_constants(1:n), cache%tp%gl_nodes, &
+                    cache%tp%gl_weights, cache%tp%legendre_gl, converged, n_iter)
+            if (.not. converged) then
+                status = BETA_PARAM_ERROR_COM_NOT_CONVERGED
+                return
+            end if
+        end if
+
+        cache%corrected_beta10 = cache%beta_local(1)
+        call eval_polar_radii_s(cache%beta_con(1:n), cache%r_north, cache%r_south)
+    end subroutine do_resolve_s
+
+    !> I_MIN_RADIUS: reject shapes whose radius is not positive everywhere.
+    !!
+    !! Poles come from the analytic values resolved in `do_resolve_s`; the
+    !! interior is scanned on the Gauss-Legendre grid, which is DESCENDING in
+    !! x — index 1 is x ~ +1 (theta ~ 0, north) and index N_QUAD is x ~ -1
+    !! (theta ~ pi, south), so a minimum at either end is attributed to that pole.
+    !!
+    !! @param[inout] cache   Initialized, already resolved cache; r_min/i_min written
+    !! @param[out]   status  SHAPE_VALID or the rejecting BETA_PARAM_ERROR_* code
+    subroutine do_validate_s(cache, status)
+        type(cache_t),      intent(inout) :: cache
+        integer(kind = ik), intent(out)   :: status
+
+        real(kind = rk) :: r_gl(N_QUAD)
+
+        status = SHAPE_VALID
+        if (cache%r_north <= R_MIN_THRESHOLD) then
+            status = BETA_PARAM_ERROR_NORTH_POLE
+            return
+        end if
+        if (cache%r_south <= R_MIN_THRESHOLD) then
+            status = BETA_PARAM_ERROR_SOUTH_POLE
+            return
+        end if
+
+        call eval_radius_grid_s(cache%beta_con(1:cache%n_params), &
+                cache%tp%legendre_gl, r_gl)
+        call find_min_radius_s(r_gl, cache%r_min, cache%i_min)
+
+        if (cache%r_min <= R_MIN_THRESHOLD) then
+            if (cache%i_min == 1_ik) then
+                status = BETA_PARAM_ERROR_NORTH_POLE
+            else if (cache%i_min == N_QUAD) then
+                status = BETA_PARAM_ERROR_SOUTH_POLE
+            else
+                status = BETA_PARAM_ERROR_INTERIOR_NEGATIVE
+            end if
+        end if
+    end subroutine do_validate_s
+
+    !> I_VOLUME: the radial scale that restores the unit-sphere volume.
+    !!
+    !! Infallible — `do_validate_s` has already guaranteed R > 0 everywhere, so
+    !! the volume integral is positive and the cube root is real.
+    !!
+    !! @param[inout] cache  Initialized, already validated cache; volume_factor written
+    subroutine do_volume_s(cache)
+        type(cache_t), intent(inout) :: cache
+
+        real(kind = rk) :: volume_integral, z_mean_integral
+
+        if (cache%conserve_volume) then
+            call compute_com_integrals_s(cache%beta_con(1:cache%n_params), &
+                    cache%tp%gl_nodes, cache%tp%gl_weights, cache%tp%legendre_gl, &
+                    volume_integral, z_mean_integral)
+            cache%volume_factor = (2.0_rk / volume_integral)**(1.0_rk / 3.0_rk)
+        else
+            cache%volume_factor = 1.0_rk
+        end if
+    end subroutine do_volume_s
+
+    ! Called AFTER shape_engine_begin_s and the buffer checks (spec precedence:
+    ! param-count status 4 must win over buffer status 104, so begin_s runs
+    ! first in every public routine; a buffer failure then zero-fills and
+    ! invalidates, which wipes the diff state begin_s stored - net effect
+    ! identical to the spec's normative order).
+    !
+    ! @param[inout] cache   Initialized cache, already through begin_s
+    ! @param[in]    params  The same parameter vector begin_s accepted
+    ! @param[out]   status  SHAPE_VALID, or the first failing stage's code
+    subroutine ensure_intermediates_s(cache, params, status)
+        type(cache_t),      intent(inout) :: cache
+        real(kind = rk),    intent(in)    :: params(:)
+        integer(kind = ik), intent(out)   :: status
+        status = SHAPE_VALID
+        if (shape_engine_needs_f(cache%engine, I_RESOLVED)) then
+            call do_resolve_s(cache, params, status)
+            if (status /= SHAPE_VALID) return
+            call shape_engine_note_computed_s(cache%engine, I_RESOLVED)
+        end if
+        if (shape_engine_needs_f(cache%engine, I_MIN_RADIUS)) then
+            call do_validate_s(cache, status)
+            if (status /= SHAPE_VALID) return
+            call shape_engine_note_computed_s(cache%engine, I_MIN_RADIUS)
+        end if
+        if (shape_engine_needs_f(cache%engine, I_VOLUME)) then
+            call do_volume_s(cache)
+            call shape_engine_note_computed_s(cache%engine, I_VOLUME)
+        end if
+    end subroutine ensure_intermediates_s
+
+    !> The failure tail every cached compute shares: drop back to cold so the
+    !! next call recomputes from scratch. Callers zero-fill their own outputs.
+    !!
+    !! @param[inout] cache  Cache whose engine is invalidated
+    pure subroutine fail_invalidate_s(cache)
+        type(cache_t), intent(inout) :: cache
+        call shape_engine_invalidate_all_s(cache%engine)
+    end subroutine fail_invalidate_s
+
+    !===========================================================================
+    ! CACHED COMPUTES
+    !===========================================================================
+
+    !> Resolve one shape: COM-corrected beta10, both pole radii, volume factor.
+    !!
+    !! The pole radii come out scaled by the volume factor (they are lengths);
+    !! `corrected_beta10` is a deformation parameter and is NOT scaled.
+    !!
+    !! Every failure zero-fills all four outputs. A failure after the engine
+    !! accepted the parameters also returns the engine to cold.
+    !!
+    !! @param[inout] cache             Initialized cache
+    !! @param[in]    params            Parameter vector, length == cache n_params
+    !! @param[out]   corrected_beta10  beta10 after the COM correction
+    !! @param[out]   r_north           R(theta = 0) x volume_factor
+    !! @param[out]   r_south           R(theta = pi) x volume_factor
+    !! @param[out]   volume_factor     Radial scale (1 when volume is not conserved)
+    !! @param[out]   status            SHAPE_VALID on success, else the rejecting code
+    subroutine cache_resolve_shape_s(cache, params, corrected_beta10, r_north, &
+            r_south, volume_factor, status)
+        type(cache_t),      intent(inout) :: cache
+        real(kind = rk),    intent(in)    :: params(:)
+        real(kind = rk),    intent(out)   :: corrected_beta10, r_north, r_south, volume_factor
+        integer(kind = ik), intent(out)   :: status
+
+        corrected_beta10 = 0.0_rk
+        r_north          = 0.0_rk
+        r_south          = 0.0_rk
+        volume_factor    = 0.0_rk
+
+        if (.not. cache%is_initialized) then
+            status = SHAPE_ERROR_CACHE_NOT_INITIALIZED
+            return
+        end if
+
+        ! begin_s self-invalidates on a wrong parameter count.
+        call shape_engine_begin_s(cache%engine, params, status)
+        if (status /= SHAPE_VALID) return
+
+        call ensure_intermediates_s(cache, params, status)
+        if (status /= SHAPE_VALID) then
+            call fail_invalidate_s(cache)
+            return
+        end if
+
+        corrected_beta10 = cache%corrected_beta10
+        volume_factor    = cache%volume_factor
+        r_north          = cache%r_north * volume_factor
+        r_south          = cache%r_south * volume_factor
+    end subroutine cache_resolve_shape_s
 
 end module beta_parameterization_mod

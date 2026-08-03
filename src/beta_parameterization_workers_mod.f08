@@ -22,14 +22,14 @@ module beta_parameterization_workers_mod
     public :: eval_radius_derivative_s
     public :: find_min_radius_s
     public :: compute_com_integrals_s
-    public :: iterate_com_correction_s
+    public :: compute_newton_com_integrals_s
+    public :: newton_com_correction_s
 
     !---------------------------------------------------------------------------
     ! COM-iteration algorithmic parameters
     !---------------------------------------------------------------------------
-    real(kind = rk),    parameter :: CM_TOLERANCE             = 1.0e-5_rk
-    real(kind = rk),    parameter :: BETA10_ADJUSTMENT_FACTOR = 1.5_rk
-    integer(kind = ik), parameter :: MAX_ITERATIONS           = 50_ik
+    real(kind = rk),    parameter :: CM_TOLERANCE   = 1.0e-5_rk
+    integer(kind = ik), parameter :: MAX_ITERATIONS = 50_ik
 
 contains
 
@@ -206,7 +206,7 @@ contains
     !> One pass of Gauss–Legendre quadrature for ∫R(θ)³ and ∫z·R(θ)⁴.
     !!
     !! The two integrals feed the volume-conservation factor and the
-    !! center-of-mass z coordinate used by `iterate_com_correction_s`.
+    !! center-of-mass z coordinate.
     !!
     !! @param[in]  beta_con          beta×norm products (size = max_beta_params)
     !! @param[in]  gl_nodes          Gauss–Legendre nodes (size = n_quad)
@@ -244,16 +244,63 @@ contains
 
     end subroutine compute_com_integrals_s
 
-    !> Iteratively adjust β₁₀ until the center-of-mass z-coordinate is < CM_TOLERANCE.
+    !> One Gauss–Legendre pass for the three integrals the Newton COM step needs.
+    !!
+    !! Same accumulator loop as `compute_com_integrals_s` plus the derivative
+    !! integral. With R(x) = 1 + Σ_k beta_con(k) P_k(x) and ∂R/∂β₁₀ = C₁·x,
+    !! the Newton residual N(β₁₀) = z_num has N'(β₁₀) = 4·C₁·z_num_deriv.
+    !!
+    !! @param[in]  beta_con         beta×norm products (size = max_beta_params)
+    !! @param[in]  gl_nodes         Gauss–Legendre nodes (size = n_quad)
+    !! @param[in]  gl_weights       Gauss–Legendre weights (size = n_quad)
+    !! @param[in]  legendre_gl      P_k at the GL nodes. Shape (n_quad, max_beta_params + 1)
+    !! @param[out] volume_integral  Σ w_i R(x_i)³
+    !! @param[out] z_num            Σ w_i x_i R(x_i)⁴
+    !! @param[out] z_num_deriv      Σ w_i x_i² R(x_i)³
+    pure subroutine compute_newton_com_integrals_s( &
+            beta_con, gl_nodes, gl_weights, legendre_gl, &
+            volume_integral, z_num, z_num_deriv)
+
+        real(kind = rk), intent(in)  :: beta_con(:)
+        real(kind = rk), intent(in)  :: gl_nodes(:)
+        real(kind = rk), intent(in)  :: gl_weights(:)
+        real(kind = rk), intent(in)  :: legendre_gl(:, :)
+        real(kind = rk), intent(out) :: volume_integral
+        real(kind = rk), intent(out) :: z_num
+        real(kind = rk), intent(out) :: z_num_deriv
+
+        integer(kind = ik) :: i, k, n_quad, n_lambda
+        real(kind = rk)    :: radius
+
+        n_quad   = size(gl_nodes, kind = ik)
+        n_lambda = size(beta_con, kind = ik)
+
+        volume_integral = 0.0_rk
+        z_num           = 0.0_rk
+        z_num_deriv     = 0.0_rk
+        do i = 1_ik, n_quad
+            radius = 1.0_rk
+            do k = 1_ik, n_lambda
+                radius = radius + beta_con(k) * legendre_gl(i, k + 1_ik)
+            end do
+            volume_integral = volume_integral + radius**3 * gl_weights(i)
+            z_num           = z_num + gl_nodes(i) * radius**4 * gl_weights(i)
+            z_num_deriv     = z_num_deriv + gl_nodes(i)**2 * radius**3 * gl_weights(i)
+        end do
+
+    end subroutine compute_newton_com_integrals_s
+
+    !> Newton iteration on β₁₀ until the center-of-mass z-coordinate vanishes.
     !!
     !! Modifies `beta_local(1)` and `beta_con(1)` in place. Reports convergence
-    !! status and iteration count to the caller; **the caller decides** whether
-    !! non-convergence is acceptable. The Fortran API in v2 treats it as a
-    !! validation failure (`LEGENDRE_ERROR_COM_NOT_CONVERGED`).
+    !! and iteration count; **the caller decides** whether non-convergence is a
+    !! failure (the API maps it to `BETA_PARAM_ERROR_COM_NOT_CONVERGED`).
     !!
-    !! Algorithm: fixed-point iteration.
-    !!   z_cm = 3 * z_mean_integral * vol_factor³ / 8     [PI_C cancels in original form]
-    !!   β₁₀ ← β₁₀ - z_cm / BETA10_ADJUSTMENT_FACTOR
+    !! Newton on N(β₁₀) = z_num, whose root is the shifted-COM condition:
+    !!   β₁₀ ← β₁₀ - z_num / (4·C₁·z_num_deriv)
+    !! Convergence is measured on the physical displacement
+    !!   z_cm = 3·z_num·vf³/8,  vf = (2/volume_integral)^(1/3).
+    !! A vanishing derivative aborts the loop; the caller sees converged = .false.
     !!
     !! @param[inout] beta_local     β values; only beta_local(1) is modified
     !! @param[inout] beta_con       beta×norm products; only beta_con(1) is modified
@@ -262,43 +309,38 @@ contains
     !! @param[in]    gl_weights     Gauss–Legendre weights
     !! @param[in]    legendre_gl    P_k at the GL nodes
     !! @param[out]   converged      .true. if |z_cm| < CM_TOLERANCE on exit
-    !! @param[out]   n_iter         Number of iterations performed
-    pure subroutine iterate_com_correction_s( &
-            beta_local, beta_con, norm_constants, &
-            gl_nodes, gl_weights, legendre_gl, &
-            converged, n_iter)
+    !! @param[out]   n_iter         Number of Newton steps performed
+    pure subroutine newton_com_correction_s(beta_local, beta_con, norm_constants, &
+            gl_nodes, gl_weights, legendre_gl, converged, n_iter)
 
-        real(kind = rk),    intent(inout) :: beta_local(:)
-        real(kind = rk),    intent(inout) :: beta_con(:)
-        real(kind = rk),    intent(in)    :: norm_constants(:)
-        real(kind = rk),    intent(in)    :: gl_nodes(:)
-        real(kind = rk),    intent(in)    :: gl_weights(:)
+        real(kind = rk),    intent(inout) :: beta_local(:), beta_con(:)
+        real(kind = rk),    intent(in)    :: norm_constants(:), gl_nodes(:), gl_weights(:)
         real(kind = rk),    intent(in)    :: legendre_gl(:, :)
         logical,            intent(out)   :: converged
         integer(kind = ik), intent(out)   :: n_iter
 
-        real(kind = rk) :: volume_integral, z_mean_integral, z_cm, vol_factor
+        real(kind = rk) :: volume_integral, z_num, z_num_deriv, z_cm, vf, n_prime
 
         n_iter = 0_ik
-
-        call compute_com_integrals_s(beta_con, gl_nodes, gl_weights, legendre_gl, &
-                volume_integral, z_mean_integral)
-        vol_factor = (2.0_rk / volume_integral)**(1.0_rk / 3.0_rk)
-        z_cm = 3.0_rk * z_mean_integral * vol_factor**3 / 8.0_rk
-
+        call compute_newton_com_integrals_s(beta_con, gl_nodes, gl_weights, &
+                legendre_gl, volume_integral, z_num, z_num_deriv)
+        vf = (2.0_rk / volume_integral)**(1.0_rk / 3.0_rk)
+        z_cm = 3.0_rk * z_num * vf**3 / 8.0_rk
         do while (abs(z_cm) >= CM_TOLERANCE .and. n_iter < MAX_ITERATIONS)
             n_iter = n_iter + 1_ik
-            beta_local(1) = beta_local(1) - z_cm / BETA10_ADJUSTMENT_FACTOR
+            n_prime = 4.0_rk * norm_constants(1) * z_num_deriv
+            ! Exactly `n_prime == 0`, spelled without an equality test on reals
+            ! (-Werror=compare-reals): |x| <= 0 holds only for +0 and -0.
+            if (abs(n_prime) <= 0.0_rk) exit
+            beta_local(1) = beta_local(1) - z_num / n_prime
             beta_con(1)   = beta_local(1) * norm_constants(1)
-
-            call compute_com_integrals_s(beta_con, gl_nodes, gl_weights, legendre_gl, &
-                    volume_integral, z_mean_integral)
-            vol_factor = (2.0_rk / volume_integral)**(1.0_rk / 3.0_rk)
-            z_cm = 3.0_rk * z_mean_integral * vol_factor**3 / 8.0_rk
+            call compute_newton_com_integrals_s(beta_con, gl_nodes, gl_weights, &
+                    legendre_gl, volume_integral, z_num, z_num_deriv)
+            vf = (2.0_rk / volume_integral)**(1.0_rk / 3.0_rk)
+            z_cm = 3.0_rk * z_num * vf**3 / 8.0_rk
         end do
-
         converged = abs(z_cm) < CM_TOLERANCE
 
-    end subroutine iterate_com_correction_s
+    end subroutine newton_com_correction_s
 
 end module beta_parameterization_workers_mod
