@@ -58,6 +58,7 @@ module beta_parameterization_mod
     ! Public types
     !---------------------------------------------------------------------------
     public :: cache_t
+    public :: tables_t
 
     !---------------------------------------------------------------------------
     ! Public standalone procedures (one-off, build a temporary cache internally)
@@ -66,9 +67,17 @@ module beta_parameterization_mod
     public :: compute_radius_grid_standalone_with_com_shift_s
 
     !---------------------------------------------------------------------------
+    ! Tables lifecycle
+    !---------------------------------------------------------------------------
+    public :: tables_init_s, tables_free_s, tables_max_l_f, tables_n_thetas_f
+
+    !---------------------------------------------------------------------------
     ! Public limits
     !---------------------------------------------------------------------------
     integer(kind = ik), parameter, public :: MAX_BETA_PARAMS_LIMIT = 64_ik
+
+    !> Fixed Gauss-Legendre quadrature order for volume/COM integrals.
+    integer(kind = ik), parameter :: N_QUAD = 512_ik
 
     !---------------------------------------------------------------------------
     ! Validation status codes
@@ -168,6 +177,30 @@ module beta_parameterization_mod
         procedure, pass(self) :: destroy      => node_set_destroy_s
     end type node_set_t
 
+    !> Shared immutable level: everything that depends only on `max_l` and the
+    !! primary theta set. Built once, then shared read-only by every consumer
+    !! (node sets, caches, standalone entry points) — no shape data inside.
+    !!
+    !! Invariants:
+    !!   - After a successful `tables_init_s`: is_initialized == .true. and every
+    !!     allocatable component is allocated to its declared shape.
+    !!   - `tables_free_s` restores the default (uninitialized) state.
+    type :: tables_t
+        private
+        logical            :: is_initialized = .false.
+        integer(kind = ik) :: max_l    = 0_ik
+        integer(kind = ik) :: n_thetas = 0_ik
+
+        real(kind = rk), allocatable :: norm_constants(:)             ! (max_l)
+        real(kind = rk), allocatable :: gl_nodes(:)                   ! (N_QUAD)
+        real(kind = rk), allocatable :: gl_weights(:)                 ! (N_QUAD)
+        real(kind = rk), allocatable :: legendre_gl(:, :)             ! (N_QUAD, max_l + 1)
+        real(kind = rk), allocatable :: thetas(:)                     ! (n_thetas)
+        real(kind = rk), allocatable :: sin_thetas(:)                 ! (n_thetas)
+        real(kind = rk), allocatable :: legendre_primary(:, :)        ! (n_thetas, max_l + 1)
+        real(kind = rk), allocatable :: legendre_primary_deriv(:, :)  ! (n_thetas, max_l + 1)
+    end type tables_t
+
 contains
 
     !> Fixed diagnostic string for a status code (spec 3.5).
@@ -192,6 +225,107 @@ contains
         case default;                                msg = 'unknown status code'
         end select
     end function status_message_f
+
+    !===========================================================================
+    ! TABLES LIFECYCLE
+    !===========================================================================
+
+    !> Reject theta sets that cannot carry Legendre derivative tables.
+    !!
+    !! @param[in]  thetas  Candidate theta nodes (radians)
+    !! @param[out] status  SHAPE_VALID, SHAPE_ERROR_INVALID_GRID or
+    !!                     BETA_PARAM_ERROR_POLE_NODE
+    subroutine validate_theta_set_s(thetas, status)
+        real(kind = rk),    intent(in)  :: thetas(:)
+        integer(kind = ik), intent(out) :: status
+        integer(kind = ik) :: i
+        status = SHAPE_VALID
+        if (size(thetas, kind = ik) < 2_ik) then
+            status = SHAPE_ERROR_INVALID_GRID
+            return
+        end if
+        do i = 1_ik, size(thetas, kind = ik)
+            ! Guard on the rounded cosine, not theta: the derivative recurrence
+            ! divides by 1 - x^2, and a tiny theta can round to cos(theta) == 1.
+            if (1.0_rk - cos(thetas(i))**2 <= 0.0_rk) then
+                status = BETA_PARAM_ERROR_POLE_NODE
+                return
+            end if
+        end do
+    end subroutine validate_theta_set_s
+
+    !> Build the shared immutable level for one `max_l` and one primary theta set.
+    !!
+    !! @param[out] tables  Fully populated on success; untouched-by-default state
+    !!                     otherwise (intent(out) resets it on entry)
+    !! @param[in]  max_l   1 <= max_l <= MAX_BETA_PARAMS_LIMIT
+    !! @param[in]  thetas  Primary theta nodes (radians), at least 2, none polar
+    !! @param[out] status  SHAPE_VALID on success, else the rejecting code
+    subroutine tables_init_s(tables, max_l, thetas, status)
+        type(tables_t),     intent(out) :: tables
+        integer(kind = ik), intent(in)  :: max_l
+        real(kind = rk),    intent(in)  :: thetas(:)
+        integer(kind = ik), intent(out) :: status
+        real(kind = rk), allocatable :: x_primary(:)
+        integer(kind = ik) :: i, n
+
+        status = SHAPE_VALID
+        if (max_l < 1_ik .or. max_l > MAX_BETA_PARAMS_LIMIT) then
+            status = SHAPE_ERROR_INVALID_INIT
+            return
+        end if
+        call validate_theta_set_s(thetas, status)
+        if (status /= SHAPE_VALID) return
+
+        n = size(thetas, kind = ik)
+        tables%max_l = max_l
+        tables%n_thetas = n
+        allocate(tables%norm_constants(max_l))
+        call compute_spherical_harmonics_normalization_constants_s( &
+                tables%norm_constants, max_l)
+        allocate(tables%gl_nodes(N_QUAD), tables%gl_weights(N_QUAD))
+        ! ff signature is (n, nodes, weights); nodes come back DESCENDING in x:
+        ! nodes(1) ~ +1 (theta ~ 0, north), nodes(N_QUAD) ~ -1 (theta ~ pi, south)
+        call compute_gauss_legendre_quadrature_s(N_QUAD, tables%gl_nodes, tables%gl_weights)
+        allocate(tables%legendre_gl(N_QUAD, max_l + 1_ik))
+        call precompute_legendre_table_s(tables%gl_nodes, max_l, tables%legendre_gl)
+
+        allocate(tables%thetas(n), tables%sin_thetas(n), x_primary(n))
+        tables%thetas = thetas
+        do i = 1_ik, n
+            x_primary(i) = cos(thetas(i))
+            tables%sin_thetas(i) = sin(thetas(i))
+        end do
+        allocate(tables%legendre_primary(n, max_l + 1_ik))
+        allocate(tables%legendre_primary_deriv(n, max_l + 1_ik))
+        call precompute_legendre_table_s(x_primary, max_l, tables%legendre_primary)
+        call precompute_legendre_derivative_table_s(x_primary, max_l, &
+                tables%legendre_primary, tables%legendre_primary_deriv)
+        tables%is_initialized = .true.
+    end subroutine tables_init_s
+
+    !> Release the tables. Infallible: intent(out) deallocates every component
+    !! and restores the default component values.
+    pure subroutine tables_free_s(tables)
+        type(tables_t), intent(out) :: tables
+        tables%is_initialized = .false.   ! intent(out) already did this; explicit for clarity
+    end subroutine tables_free_s
+
+    !> Highest Legendre order the tables were built for; 0 when uninitialized.
+    pure function tables_max_l_f(tables) result(max_l)
+        type(tables_t), intent(in) :: tables
+        integer(kind = ik) :: max_l
+        max_l = 0_ik
+        if (tables%is_initialized) max_l = tables%max_l
+    end function tables_max_l_f
+
+    !> Number of primary theta nodes; 0 when uninitialized.
+    pure function tables_n_thetas_f(tables) result(n)
+        type(tables_t), intent(in) :: tables
+        integer(kind = ik) :: n
+        n = 0_ik
+        if (tables%is_initialized) n = tables%n_thetas
+    end function tables_n_thetas_f
 
     !===========================================================================
     ! LIFECYCLE
