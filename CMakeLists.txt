@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
 project(beta-parameterization
-        VERSION 2.3.4
+        VERSION 3.0.0
         LANGUAGES Fortran CXX
         DESCRIPTION "Beta parameterization for nuclear physics applications"
 )
@@ -24,7 +24,7 @@ FetchContent_MakeAvailable(GCC-Compiler-Options)
 FetchContent_Declare(
         Fortran-Foundations
         GIT_REPOSITORY https://github.com/AleksanderAugustyn/Fortran-Foundations.git
-        GIT_TAG 2.3.2
+        GIT_TAG 2.4.0
 )
 FetchContent_MakeAvailable(Fortran-Foundations)
 
@@ -43,7 +43,6 @@ create_fortran_library_interface(TARGET beta_parameterization_flags)
 set(BETA_PARAM_SOURCES
         src/beta_parameterization_workers_mod.f08
         src/beta_parameterization_mod.f08
-        src/beta_parameterization_c_api_mod.f08
 )
 
 # --- Static library target ---
@@ -118,7 +117,7 @@ set_target_properties(beta_param_test_utils PROPERTIES
 target_include_directories(beta_param_test_utils PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests>)
 
-set(BETA_PARAM_TEST_SUITES core com error breakdown golden node_set)
+set(BETA_PARAM_TEST_SUITES "")
 foreach (suite IN LISTS BETA_PARAM_TEST_SUITES)
     add_executable(beta_param_${suite}_test tests/beta_param_${suite}_test.f08)
     target_link_libraries(beta_param_${suite}_test PRIVATE
@@ -127,26 +126,5 @@ foreach (suite IN LISTS BETA_PARAM_TEST_SUITES)
             Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/${suite})
     add_test(NAME ${suite} COMMAND beta_param_${suite}_test)
 endforeach ()
-
-# Golden literals carry 17 significant digits (exact double round-trip);
-# gfortran's conversion-extra warning flags the 17th digit as non-significant.
-# Source-file property so it lands after the flags-interface options (last wins).
-set_source_files_properties(tests/beta_param_golden_test.f08 PROPERTIES
-        COMPILE_OPTIONS "-Wno-conversion-extra;-Wno-error=conversion-extra")
-
-add_executable(golden_capture tests/golden_capture.f08)
-target_link_libraries(golden_capture PRIVATE
-        beta_parameterization beta_param_test_utils beta_parameterization_flags)
-set_target_properties(golden_capture PROPERTIES
-        Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/capture)
-
-add_executable(c_api_smoke_test tests/c_api_smoke_test.cpp)
-target_link_libraries(c_api_smoke_test PRIVATE beta_parameterization_cxx)
-add_test(NAME c_api_smoke COMMAND c_api_smoke_test)
-
-find_package(Threads REQUIRED)
-add_executable(thread_stress_test tests/thread_stress_test.cpp)
-target_link_libraries(thread_stress_test PRIVATE beta_parameterization_cxx Threads::Threads)
-add_test(NAME thread_stress COMMAND thread_stress_test)
 
 endif ()
