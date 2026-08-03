@@ -142,6 +142,18 @@ target_link_libraries(golden_capture PRIVATE
 set_target_properties(golden_capture PROPERTIES
         Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/capture)
 
+# PES-range sweep: 1.55M shapes, far too slow for ctest. An executable driven
+# by an explicit custom target, never registered with add_test.
+add_executable(beta_pes_sweep tests/beta_pes_sweep.f08)
+target_link_libraries(beta_pes_sweep PRIVATE
+        beta_parameterization beta_param_test_utils beta_parameterization_flags)
+set_target_properties(beta_pes_sweep PROPERTIES
+        Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/sweep)
+add_custom_target(test_beta_pes_sweep
+        COMMAND beta_pes_sweep
+        DEPENDS beta_pes_sweep
+        COMMENT "Running the PES-range sweep (1.55M + 172.8k shapes)")
+
 # C API smoke test: links the SHARED library, the binary the bindings load.
 add_executable(c_api_smoke_test tests/c_api_smoke_test.cpp)
 target_link_libraries(c_api_smoke_test PRIVATE beta_parameterization_cxx)
