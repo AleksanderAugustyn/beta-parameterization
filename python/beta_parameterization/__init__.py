@@ -1,23 +1,22 @@
 """Python bindings for the beta (Legendre) nuclear-shape parameterization."""
-from ._cdefs import MAX_BETA_PARAMS_LIMIT, MESSAGE_BUFFER_SIZE
+from ._cdefs import CACHE_MAX_PARAMS, MAX_BETA_PARAMS_LIMIT
 from ._libloader import load_library
 from .api import (
     BetaParamError,
     Cache,
-    NodeSet,
     RadiusDerivativeResult,
     RadiusGridResult,
     ResolvedShape,
     Status,
-    radius_grid_standalone,
-    radius_grid_standalone_with_com_shift,
+    radius_and_derivative,
+    radius_grid,
+    status_message,
     theta_grid,
 )
 
 __all__ = [
-    "BetaParamError", "Cache", "NodeSet", "RadiusDerivativeResult",
-    "RadiusGridResult", "ResolvedShape", "Status",
-    "radius_grid_standalone", "radius_grid_standalone_with_com_shift",
-    "theta_grid", "load_library",
-    "MAX_BETA_PARAMS_LIMIT", "MESSAGE_BUFFER_SIZE",
+    "BetaParamError", "Cache", "RadiusDerivativeResult", "RadiusGridResult",
+    "ResolvedShape", "Status",
+    "radius_and_derivative", "radius_grid", "status_message", "theta_grid",
+    "load_library", "CACHE_MAX_PARAMS", "MAX_BETA_PARAMS_LIMIT",
 ]

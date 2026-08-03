@@ -1,4 +1,8 @@
-"""Python == Fortran: bindings must reproduce the library bit-for-bit."""
+"""Contract tests for the 3.0.0 Python surface.
+
+Shape-validation failures are results, not exceptions; only usage errors
+(closed handle, non-1-D input, failed create) raise BetaParamError.
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -6,180 +10,144 @@ import pytest
 
 import beta_parameterization as bp
 
-# Golden shapes shared with tests/beta_param_golden_test.f08 (Task 8).
-# Values pasted from golden_capture output at commit 8bfe973 (17 sig digits,
-# exact double round-trip). Cache max_beta_params=8, n_grid=181.
-G1_PARAMS = [0.0, 0.215, 0.0, 0.095]
-G1_EXPECTED = [
-    1.2160153887141389,
-    1.0866457882160419,
-    0.95980794102974309,
-    0.96233969434154143,
-    0.95980794102974309,
-    1.0866457882160419,
-    1.2160153887141389,
-]
-G2_PARAMS = [0.0, 0.85, 0.35, 0.18, 0.05, 0.02]
-G2_EXPECTED = [
-    1.9145931553115427,
-    1.3169048809475408,
-    0.73431444834952730,
-    0.78268444464280551,
-    1.0567285473303596,
-    1.3452258418380265,
-    1.5030848311140956,
-]
-G2_CORRECTED_B10 = -0.20926908316026530
-GOLDEN_IDX = [0, 30, 60, 90, 120, 150, 180]
+SPHERE_4 = np.zeros(4)
+ASYMMETRIC_4 = [0.10, 0.30, 0.15, 0.05]
+INVALID_4 = [0.0, -1.8, 0.0, 0.0]
 
 
-def test_sphere_exact() -> None:
-    with bp.Cache(max_beta_params=8, n_grid=181) as cache:
-        res = cache.radius_grid(np.zeros(4))
-    assert res.status == bp.Status.VALID
+# --- theta_grid ------------------------------------------------------------
+
+def test_theta_grid_is_open_and_uniform() -> None:
+    thetas = bp.theta_grid(721)
+    assert thetas.size == 721
+    assert thetas[0] > 0.0
+    assert thetas[-1] < np.pi
+    spacing = np.diff(thetas)
+    assert np.allclose(spacing, np.pi / 722.0, rtol=0.0, atol=1.0e-12)
+
+
+def test_theta_grid_excludes_both_poles_for_small_n() -> None:
+    thetas = bp.theta_grid(3)
+    assert np.allclose(thetas, np.array([1.0, 2.0, 3.0]) * np.pi / 4.0)
+
+
+# --- module-level (standalone) tier ---------------------------------------
+
+def test_sphere_radius_grid_is_unit() -> None:
+    res = bp.radius_grid(SPHERE_4, bp.theta_grid(181))
     assert res.ok
-    np.testing.assert_array_equal(res.radii, np.ones(181))
+    assert res.status == bp.Status.valid
+    assert np.allclose(res.radii, 1.0, rtol=0.0, atol=1.0e-14)
 
 
-def test_golden_g1_matches_fortran() -> None:
-    with bp.Cache(max_beta_params=8, n_grid=181) as cache:
-        res = cache.radius_grid(G1_PARAMS)
-    assert res.status == bp.Status.VALID
-    np.testing.assert_allclose(res.radii[GOLDEN_IDX], G1_EXPECTED, rtol=1e-15, atol=0.0)
+def test_sphere_derivative_is_zero() -> None:
+    res = bp.radius_and_derivative(SPHERE_4, bp.theta_grid(64))
+    assert res.ok
+    assert np.allclose(res.radii, 1.0, rtol=0.0, atol=1.0e-14)
+    assert np.allclose(res.dr_dtheta, 0.0, rtol=0.0, atol=1.0e-14)
 
 
-def test_golden_g2_com_shift_matches_fortran() -> None:
-    with bp.Cache(max_beta_params=8, n_grid=181) as cache:
-        res = cache.radius_grid_with_com_shift(G2_PARAMS)
-    assert res.status == bp.Status.VALID
-    assert res.corrected_beta10 == pytest.approx(G2_CORRECTED_B10, rel=1e-15)
-    np.testing.assert_allclose(res.radii[GOLDEN_IDX], G2_EXPECTED, rtol=1e-15, atol=0.0)
+def test_standalone_matches_cache() -> None:
+    thetas = bp.theta_grid(64)
+    standalone = bp.radius_grid(ASYMMETRIC_4, thetas,
+                                conserve_volume=True, apply_com=True)
+    with bp.Cache(4, thetas, conserve_volume=True, apply_com=True) as cache:
+        cached = cache.radius_grid(ASYMMETRIC_4)
+    assert standalone.ok and cached.ok
+    assert np.array_equal(standalone.radii, cached.radii)
 
 
-def test_cache_equals_standalone() -> None:
-    params = [0.0, 0.25, 0.10, 0.05]
-    with bp.Cache(max_beta_params=4, n_grid=181) as cache:
-        res_cache = cache.radius_grid(params)
-    res_sa = bp.radius_grid_standalone(params, n_grid=181)
-    np.testing.assert_array_equal(res_cache.radii, res_sa.radii)
+# --- cached tier -----------------------------------------------------------
+
+def test_cache_resolves_asymmetric_shape() -> None:
+    with bp.Cache(4, bp.theta_grid(64),
+                  conserve_volume=True, apply_com=True) as cache:
+        resolved = cache.resolve_shape(ASYMMETRIC_4)
+    assert resolved.ok
+    assert resolved.status == bp.Status.valid
+    assert resolved.volume_factor > 0.0
+    assert resolved.r_north > 0.0
+    assert resolved.r_south > 0.0
+    assert resolved.corrected_beta10 != ASYMMETRIC_4[0]
 
 
-def test_error_codes_surface_as_status() -> None:
-    with bp.Cache(max_beta_params=4, n_grid=181) as cache:
-        res = cache.radius_grid([0.0, 4.0])          # interior negative
-        assert res.status == bp.Status.ERROR_INTERIOR_NEGATIVE
-        assert not res.ok
-        assert res.message                            # non-empty, content not asserted
-        res = cache.radius_grid([0.1] * 5)            # too many params
-        assert res.status == bp.Status.ERROR_TOO_MANY_PARAMS
+def test_invalid_shape_returns_status_not_exception() -> None:
+    with bp.Cache(4, bp.theta_grid(64)) as cache:
+        res = cache.radius_grid(INVALID_4)
+    assert res.status != bp.Status.valid
+    assert not res.ok
+    assert np.all(res.radii == 0.0)
+    assert res.message
 
 
-def test_com_shift_returns_corrected_beta10() -> None:
-    with bp.Cache(max_beta_params=4, n_grid=181) as cache:
-        res = cache.radius_grid_with_com_shift([0.30, 0.60, 0.40, 0.10])
-    assert res.status == bp.Status.VALID
-    assert res.corrected_beta10 is not None
-    assert abs(res.corrected_beta10 - 0.30) > 1e-6
+def test_unchecked_returns_negative_radii_for_invalid_shape() -> None:
+    with bp.Cache(4, bp.theta_grid(64), apply_com=False) as cache:
+        res = cache.radius_grid_unchecked(INVALID_4)
+    assert res.ok
+    assert np.any(res.radii < 0.0)
 
 
-def test_constructor_raises_on_bad_init() -> None:
-    with pytest.raises(bp.BetaParamError):
-        bp.Cache(max_beta_params=0, n_grid=181)
-    with pytest.raises(bp.BetaParamError):
-        bp.Cache(max_beta_params=bp.MAX_BETA_PARAMS_LIMIT + 1, n_grid=181)
+def test_wrong_param_count_is_a_status_not_an_exception() -> None:
+    with bp.Cache(4, bp.theta_grid(64)) as cache:
+        res = cache.radius_grid([0.0, 0.2, 0.0])
+    assert res.status == bp.Status.wrong_param_count
+    assert not res.ok
+    assert np.all(res.radii == 0.0)
 
 
-def test_theta_grid() -> None:
-    t = bp.theta_grid(181)
-    assert t.shape == (181,)
-    assert t[0] == 0.0
-    assert t[-1] == pytest.approx(np.pi, rel=1e-15)
+def test_too_many_params_raises() -> None:
+    with pytest.raises(bp.BetaParamError, match="too many"):
+        bp.Cache(9, bp.theta_grid(64))
 
+
+def test_cache_derivative_matches_finite_difference() -> None:
+    thetas = bp.theta_grid(2001)
+    with bp.Cache(4, thetas) as cache:
+        res = cache.radius_and_derivative(ASYMMETRIC_4)
+    assert res.ok
+    fd = np.gradient(res.radii, thetas)
+    assert np.allclose(res.dr_dtheta[5:-5], fd[5:-5], rtol=1.0e-4, atol=1.0e-6)
+
+
+# --- usage errors ----------------------------------------------------------
 
 def test_use_after_close_raises() -> None:
-    cache = bp.Cache(max_beta_params=4, n_grid=41)
+    cache = bp.Cache(4, bp.theta_grid(16))
     cache.close()
+    cache.close()  # idempotent
+    with pytest.raises(bp.BetaParamError, match="closed"):
+        cache.radius_grid(SPHERE_4)
+
+
+def test_non_1d_params_raise() -> None:
+    with bp.Cache(4, bp.theta_grid(16)) as cache:
+        with pytest.raises(bp.BetaParamError):
+            cache.radius_grid(np.zeros((2, 2)))
+
+
+def test_pole_theta_rejected_at_create() -> None:
     with pytest.raises(bp.BetaParamError):
-        cache.radius_grid([0.0, 0.2])
+        bp.Cache(4, np.linspace(0.0, np.pi, 32))
 
 
-def test_node_set_resolve_evaluate_fd_parity() -> None:
-    thetas = np.linspace(0.2, np.pi - 0.2, 50)
-    h = 1e-3
-    stencil = np.concatenate([thetas - 2 * h, thetas - h, thetas + h, thetas + 2 * h])
-    params = [0.15, 0.25, 0.1, 0.05, 0.02]
+# --- diagnostics -----------------------------------------------------------
 
-    with bp.Cache(8, 181) as cache:
-        resolved = cache.resolve_shape(params)
-        assert resolved.ok
-        assert resolved.r_north > 0.0 and resolved.r_south > 0.0
-
-        with cache.build_node_set(thetas) as nodes, cache.build_node_set(stencil) as st:
-            result = cache.radius_and_derivative(resolved.beta_con, nodes)
-            assert result.ok
-            sr = cache.radius_and_derivative(resolved.beta_con, st).radii
-            n = thetas.size
-            fd = (sr[:n] - 8 * sr[n:2 * n] + 8 * sr[2 * n:3 * n] - sr[3 * n:]) / (12 * h)
-            np.testing.assert_allclose(result.dr_dtheta, fd, rtol=0.0, atol=1e-9)
+def test_status_message_covers_every_code() -> None:
+    for status in bp.Status:
+        message = bp.status_message(status)
+        assert message and "unknown" not in message
+    assert "north" in bp.status_message(bp.Status.north_pole)
+    assert bp.Status.node_set_mismatch == 106
 
 
-def test_node_set_matches_uniform_grid() -> None:
-    n_grid = 181
-    params = [0.1, 0.2, 0.05, 0.1]
-    interior = bp.theta_grid(n_grid)[1:-1]
+# --- removed 2.x surface ---------------------------------------------------
 
-    with bp.Cache(8, n_grid) as cache:
-        ref = cache.radius_grid_with_com_shift(params)
-        assert ref.ok
-        resolved = cache.resolve_shape(params)
-        assert resolved.corrected_beta10 == pytest.approx(ref.corrected_beta10, abs=1e-15)
-        with cache.build_node_set(interior) as nodes:
-            result = cache.radius_and_derivative(resolved.beta_con, nodes)
-            np.testing.assert_allclose(result.radii, ref.radii[1:-1], rtol=0.0, atol=1e-15)
-
-
-def test_node_set_pole_rejected() -> None:
-    with bp.Cache(8, 181) as cache:
-        with pytest.raises(bp.BetaParamError, match="pole"):
-            cache.build_node_set(np.array([0.0, 1.0]))
-
-
-def test_resolve_shape_no_com_flag() -> None:
-    params = [0.1, 0.2, 0.05, 0.1]
-    with bp.Cache(8, 181) as cache:
-        com = cache.resolve_shape(params)
-        no_com = cache.resolve_shape(params, apply_com_correction=False)
-        assert com.ok and no_com.ok
-        assert no_com.corrected_beta10 == 0.1        # input beta10 untouched
-        assert com.corrected_beta10 != 0.1           # COM iteration moved it
-        # no-COM parity with the legacy uniform-grid API (compute_radius_grid)
-        ref = cache.radius_grid(params)
-        interior = bp.theta_grid(181)[1:-1]
-        with cache.build_node_set(interior) as ns:
-            res = cache.radius_and_derivative(no_com.beta_con, ns)
-            np.testing.assert_allclose(res.radii, ref.radii[1:-1], rtol=0.0, atol=1e-15)
-
-
-def test_node_set_only_cache_matches_full() -> None:
-    thetas = np.linspace(0.2, np.pi - 0.2, 9)
-    with bp.Cache(max_beta_params=8) as lean, \
-            bp.Cache(max_beta_params=8, n_grid=181) as full:
-        assert lean.n_grid == 0
-        rs_lean = lean.resolve_shape(G2_PARAMS)
-        rs_full = full.resolve_shape(G2_PARAMS)
-        assert rs_lean.ok and rs_full.ok
-        assert rs_lean.corrected_beta10 == rs_full.corrected_beta10
-        rd_lean = lean.radius_and_derivative(rs_lean.beta_con, lean.build_node_set(thetas))
-        rd_full = full.radius_and_derivative(rs_full.beta_con, full.build_node_set(thetas))
-        assert rd_lean.ok and rd_full.ok
-        np.testing.assert_array_equal(rd_lean.radii, rd_full.radii)
-        np.testing.assert_array_equal(rd_lean.dr_dtheta, rd_full.dr_dtheta)
-
-
-def test_node_set_only_cache_rejects_uniform_entry_points() -> None:
-    with bp.Cache(max_beta_params=8) as lean:
-        res = lean.radius_grid(G1_PARAMS)
-        assert res.status == bp.Status.ERROR_NO_UNIFORM_GRID
-        assert not res.ok
-        res_com = lean.radius_grid_with_com_shift(G1_PARAMS)
-        assert res_com.status == bp.Status.ERROR_NO_UNIFORM_GRID
+@pytest.mark.parametrize("name", [
+    "NodeSet", "MESSAGE_BUFFER_SIZE", "radius_grid_with_com_shift",
+    "build_node_set", "radius_grid_standalone",
+    "radius_grid_standalone_with_com_shift",
+])
+def test_removed_names_absent(name: str) -> None:
+    assert not hasattr(bp, name)
+    assert name not in bp.__all__
+    assert not hasattr(bp.Cache, name)
