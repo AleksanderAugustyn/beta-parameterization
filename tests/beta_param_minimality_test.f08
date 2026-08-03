@@ -59,6 +59,7 @@ program beta_param_minimality_test
 
     call run_index_mirror_s()
     call run_counter_table_s()
+    call run_cold_partial_stages_s()
     call run_negzero_counter_s()
 
     call node_set_free_s(nodes)
@@ -170,6 +171,44 @@ contains
         want = 0_ik
         call check_counters_s(cache, want, 'cache_free_s')
     end subroutine run_counter_table_s
+
+    !> The two entry points that stop at I_VOLUME, each on a FRESH cache. Warm
+    !! checkpoints cannot see over-computation here: on a cache where all five
+    !! stamps are already valid, an ensure call raised to I_DERIV would recompute
+    !! nothing and the counters would not move. Cold is the only state that
+    !! shows where each entry point actually stops.
+    subroutine run_cold_partial_stages_s()
+        type(cache_t) :: resolve_cache, node_cache
+        real(kind = rk) :: params(N_PARAMS)
+        real(kind = rk) :: node_radii(N_NODES), node_drs(N_NODES)
+        real(kind = rk) :: b10, rn, rs, vf
+        integer(kind = ik) :: want(N_TRACKED)
+        integer(kind = ik) :: status
+
+        params = base_params
+        want = [1_ik, 1_ik, 1_ik, 0_ik, 0_ik]
+
+        ! Cold resolve: intermediates 1-3 only; the radius and derivative tables
+        ! stay cold because resolve never asks for them.
+        call cache_init_shared_s(resolve_cache, tables, N_PARAMS, .true., .true., status)
+        call assert_int_eq(status, SHAPE_VALID, 'cold resolve cache init')
+        call cache_resolve_shape_s(resolve_cache, params, b10, rn, rs, vf, status)
+        call assert_int_eq(status, SHAPE_VALID, 'cold resolve status')
+        call check_counters_s(resolve_cache, want, 'cold resolve')
+        call cache_free_s(resolve_cache)
+
+        ! Cold node call: the node evaluation is uncached, so it shares
+        ! intermediates 1-3 with the grid path and computes nothing else.
+        call cache_init_shared_s(node_cache, tables, N_PARAMS, .true., .true., status)
+        call assert_int_eq(status, SHAPE_VALID, 'cold node cache init')
+        call cache_node_radius_and_derivative_s(node_cache, nodes, params, node_radii, &
+                node_drs, status)
+        call assert_int_eq(status, SHAPE_VALID, 'cold node status')
+        call check_counters_s(node_cache, want, 'cold node call')
+        call assert_true(maxval(abs(node_drs)) > 0.0_rk, &
+                'cold node derivatives are not identically zero')
+        call cache_free_s(node_cache)
+    end subroutine run_cold_partial_stages_s
 
     !> Counter half of the -0.0 case: the parameter diff is on bit patterns, so
     !! replacing +0.0 by -0.0 is a change even though the two compare equal.
