@@ -52,12 +52,32 @@ catches most of these at the call site.
   — always-on recompute counters for cache-minimality testing.
 - `BETA_PARAM_ERROR_NODE_SET_MISMATCH` (106) for an unbuilt node set or one
   whose `max_l` is below the cache's `n_params`.
+- Public constants for the two tier caps, so callers can check before creating
+  anything: `SHAPE_CACHE_MAX_PARAMS` (8) and `SHAPE_STANDALONE_MAX_PARAMS` (64)
+  re-exported from Fortran, `BETA_PARAM_CACHE_MAX_PARAMS` (8) and
+  `BETA_PARAM_MAX_PARAMS_LIMIT` (64) in the C header,
+  `beta_param::cache_max_params` / `beta_param::max_params_limit` in the C++
+  header, and `CACHE_MAX_PARAMS` (8) / `MAX_BETA_PARAMS_LIMIT` (64) in Python.
 - The documented dependency map lives in the module header of
   `src/beta_parameterization_mod.f08`: five intermediates, every mask = all
   `n_params` bits.
 
 ### Changed
 
+- **BREAKING: the cached tier now caps `n_params` at 8, down from 64.** A cache
+  carries the recompute engine, whose per-intermediate dependency masks are
+  fixed-width, so `shape_core`'s `SHAPE_CACHE_MAX_PARAMS` = 8 is the hard limit.
+  `cache_init_s` / `cache_init_shared_s` reject `n_params` outside `1..8` with
+  `SHAPE_ERROR_TOO_MANY_PARAMS` (1) — the engine check runs before any table is
+  built, so nothing is allocated. **The standalone tier is unaffected and still
+  accepts up to 64** (`SHAPE_STANDALONE_MAX_PARAMS`): it constructs no engine.
+  2.x accepted `max_beta_params` up to 64 for the cache, so any consumer that
+  created a cache with more than 8 parameters — wmmm's
+  `number_of_deformation_parameters = 20` is the known case — fails at cache
+  creation and must either reduce its parameter count or move to the standalone
+  tier. Beta PES calculations realistically stay within 8 dimensions; wmmm's
+  20 existed for fos→beta conversion, which is obsolete now that fos works on
+  the radius grid directly.
 - **BREAKING: the internal uniform grid is gone.** 2.x caches took `n_grid` and
   generated their own uniform theta grid. 3.0.0 takes an explicit **primary
   theta set** — `tables_init_s(tables, max_l, thetas, status)`,
@@ -86,9 +106,11 @@ catches most of these at the call site.
 - Standalone tier: `compute_radius_grid_standalone_s(params, thetas,
   conserve_volume, apply_com, radii, status)` and
   `compute_radius_and_derivative_standalone_s(...)`. `n_params = size(params)`,
-  accepted up to 64; above → `SHAPE_ERROR_TOO_MANY_PARAMS`, never silent
-  truncation. The `max_beta_params` padding argument is removed. Tier 1 never
-  constructs an engine.
+  accepted up to the **standalone** cap of 64
+  (`SHAPE_STANDALONE_MAX_PARAMS` = `MAX_BETA_PARAMS_LIMIT`); above →
+  `SHAPE_ERROR_TOO_MANY_PARAMS`, never silent truncation. The
+  `max_beta_params` padding argument is removed. Tier 1 never constructs an
+  engine, which is why it keeps the higher cap.
 - Failure semantics are now uniform: on ANY nonzero status inside a checked
   cached compute the library zero-fills every output and invalidates the whole
   engine, so the next call runs cold. Usage errors follow the contract's
