@@ -66,6 +66,8 @@ module beta_parameterization_mod
     !---------------------------------------------------------------------------
     public :: cache_resolve_shape_s
     public :: cache_radius_grid_s, cache_radius_and_derivative_s
+    public :: cache_node_radius_and_derivative_s
+    public :: cache_radius_grid_unchecked_s
 
     !---------------------------------------------------------------------------
     ! Public limits
@@ -910,5 +912,124 @@ contains
         radii(:)      = cache%radii(:)
         dr_dthetas(:) = cache%dr_dthetas(:)
     end subroutine cache_radius_and_derivative_s
+
+    !> R(theta) and dR/dtheta at a caller-owned node set, both volume-scaled.
+    !!
+    !! Uncached by design: the node values go straight into the caller's buffers
+    !! and are never stored in the cache, so a cache can serve any number of node
+    !! sets without evicting the primary-grid results. Only intermediates 1-3
+    !! (resolve, validity, volume) are shared with the cached path — those stay
+    !! cached, so the per-node cost is the two table evaluations alone.
+    !!
+    !! The node set must be built and carry Legendre orders up to at least the
+    !! cache parameter count (`BETA_PARAM_ERROR_NODE_SET_MISMATCH`); buffers are
+    !! checked against the node count first. Every failure zero-fills both
+    !! buffers, and a failure after the engine accepted the parameters also
+    !! returns the engine to cold.
+    !!
+    !! @param[inout] cache       Initialized cache
+    !! @param[in]    node_set    Built node set with max_l >= cache n_params
+    !! @param[in]    params      Parameter vector, length == cache n_params
+    !! @param[out]   radii       R(theta_i) x volume_factor; size == node count
+    !! @param[out]   dr_dthetas  dR/dtheta at theta_i x volume_factor; same size
+    !! @param[out]   status      SHAPE_VALID on success, else the rejecting code
+    subroutine cache_node_radius_and_derivative_s(cache, node_set, params, radii, &
+            dr_dthetas, status)
+        type(cache_t),      intent(inout) :: cache
+        type(node_set_t),   intent(in)    :: node_set
+        real(kind = rk),    intent(in)    :: params(:)
+        real(kind = rk),    intent(out)   :: radii(:), dr_dthetas(:)
+        integer(kind = ik), intent(out)   :: status
+
+        integer(kind = ik) :: n
+
+        radii(:)      = 0.0_rk
+        dr_dthetas(:) = 0.0_rk
+
+        if (.not. cache%is_initialized) then
+            status = SHAPE_ERROR_CACHE_NOT_INITIALIZED
+            return
+        end if
+
+        call shape_engine_begin_s(cache%engine, params, status)
+        if (status /= SHAPE_VALID) return
+
+        n = node_set_n_nodes_f(node_set)
+        if (size(radii, kind = ik) /= n .or. size(dr_dthetas, kind = ik) /= n) then
+            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
+            call fail_invalidate_s(cache)
+            return
+        end if
+
+        if (.not. node_set%is_built .or. node_set%max_l < cache%n_params) then
+            status = BETA_PARAM_ERROR_NODE_SET_MISMATCH
+            call fail_invalidate_s(cache)
+            return
+        end if
+
+        call ensure_intermediates_s(cache, params, I_VOLUME, status)
+        if (status /= SHAPE_VALID) then
+            radii(:)      = 0.0_rk
+            dr_dthetas(:) = 0.0_rk
+            call fail_invalidate_s(cache)
+            return
+        end if
+
+        call eval_radius_grid_s(cache%beta_con(1:cache%n_params), &
+                node_set%legendre_table, radii)
+        call eval_radius_derivative_s(cache%beta_con(1:cache%n_params), &
+                node_set%legendre_deriv_table, node_set%sin_thetas, dr_dthetas)
+        radii(:)      = radii(:) * cache%volume_factor
+        dr_dthetas(:) = dr_dthetas(:) * cache%volume_factor
+    end subroutine cache_node_radius_and_derivative_s
+
+    !> R(theta) on the primary grid with validation and volume scaling skipped.
+    !!
+    !! The rendering path: it resolves the parameters (COM correction included
+    !! when the cache asks for it) and evaluates the Legendre sum, nothing more.
+    !! A shape the validity check would reject comes back as a broken outline
+    !! with SHAPE_VALID instead of an error code — which is the point, since a
+    !! plot of the rejected shape is what explains the rejection.
+    !!
+    !! Skipping I_MIN_RADIUS and I_VOLUME costs nothing later: they stay cold,
+    !! and a subsequent checked call on the same parameters computes exactly the
+    !! stages the unchecked call left out.
+    !!
+    !! @param[inout] cache   Initialized cache
+    !! @param[in]    params  Parameter vector, length == cache n_params
+    !! @param[out]   radii   R(theta_i), unscaled; size == cache n_thetas
+    !! @param[out]   status  SHAPE_VALID, or an init/param/buffer/COM code
+    subroutine cache_radius_grid_unchecked_s(cache, params, radii, status)
+        type(cache_t),      intent(inout) :: cache
+        real(kind = rk),    intent(in)    :: params(:)
+        real(kind = rk),    intent(out)   :: radii(:)
+        integer(kind = ik), intent(out)   :: status
+
+        radii(:) = 0.0_rk
+
+        if (.not. cache%is_initialized) then
+            status = SHAPE_ERROR_CACHE_NOT_INITIALIZED
+            return
+        end if
+
+        call shape_engine_begin_s(cache%engine, params, status)
+        if (status /= SHAPE_VALID) return
+
+        if (size(radii, kind = ik) /= tables_n_thetas_f(cache%tp)) then
+            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
+            call fail_invalidate_s(cache)
+            return
+        end if
+
+        ! I_RESOLVED only: no validity scan, no volume integral.
+        call ensure_intermediates_s(cache, params, I_RESOLVED, status)
+        if (status /= SHAPE_VALID) then
+            call fail_invalidate_s(cache)
+            return
+        end if
+
+        call eval_radius_grid_s(cache%beta_con(1:cache%n_params), &
+                cache%tp%legendre_primary, radii)
+    end subroutine cache_radius_grid_unchecked_s
 
 end module beta_parameterization_mod
