@@ -156,6 +156,21 @@ module beta_parameterization_mod
     !!     with the `target` attribute** and must keep it alive (and not free it)
     !!     for the whole lifetime of the cache.
     !!
+    !! ## `cache_free_s` is mandatory — there is no finalizer
+    !!
+    !! `cache_t` has no `final` binding, and both init routines take
+    !! `intent(out) :: cache`, which default-initializes the cache on entry and
+    !! so nulls `tp` before the previous target can be released. A private-mode
+    !! cache therefore leaks its heap `tables_t` (and every allocatable inside
+    !! it) if you either
+    !!   - re-initialize a live cache (`cache_init_s(c, 4, ...)` then
+    !!     `cache_init_s(c, 6, ...)` with no intervening free), or
+    !!   - let the cache go out of scope without freeing it.
+    !!
+    !! Call `cache_free_s` before every re-initialization and before the cache
+    !! goes out of scope. (A `final` binding is not the fix: `cache_free_s`
+    !! resets through `cache = cache_t()`, whose LHS finalization would recurse.)
+    !!
     !! ## Never copy-assign a cache_t
     !!
     !! Intrinsic assignment (`b = a`, passing by value, storing in an array that
@@ -411,6 +426,11 @@ contains
     !! The tables are heap-allocated through `cache%tp` and released by
     !! `cache_free_s`. Use `cache_init_shared_s` when many caches should share
     !! one `tables_t`.
+    !!
+    !! **Call `cache_free_s` first when re-initializing a live cache, and again
+    !! before the cache goes out of scope.** There is no finalizer, and
+    !! `intent(out) :: cache` nulls `tp` on entry, so re-initializing without a
+    !! free leaks the previous heap `tables_t` and everything inside it.
     !!
     !! @param[out] cache            Ready on success; default (uninitialized)
     !!                              state on any failure
