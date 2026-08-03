@@ -57,8 +57,8 @@ contains
     !> Fill `deriv_table(i, k+1) = P_k'(x_values(i))` for k = 0..max_lambda.
     !!
     !! Uses (1-x**2) * P_k'(x) = k * (P_{k-1}(x) - x * P_k(x)). Caller guarantees
-    !! |x| < 1: Gauss-Legendre nodes never land on the poles, and build_node_set
-    !! rejects pole nodes before calling this.
+    !! |x| < 1: Gauss-Legendre nodes never land on the poles, and the theta-set
+    !! validation rejects pole nodes before calling this.
     !!
     !! @param[in]  x_values        Evaluation points, |x| < 1
     !! @param[in]  max_lambda      Highest Legendre order
