@@ -14,7 +14,7 @@
 !! (`SHAPE_*` codes, library codes >= 100); none of them stop.
 module beta_parameterization_mod
 
-    use precision_utilities_mod, only: ik, rk
+    use precision_utilities_mod, only: ik, ikl, rk
     use mathematical_utilities_mod, only: &
             compute_spherical_harmonics_normalization_constants_s, &
             compute_gauss_legendre_quadrature_s
@@ -26,7 +26,7 @@ module beta_parameterization_mod
             SHAPE_CACHE_MAX_PARAMS, SHAPE_STANDALONE_MAX_PARAMS, &
             shape_engine_t, shape_engine_init_s, shape_engine_begin_s, &
             shape_engine_needs_f, shape_engine_note_computed_s, &
-            shape_engine_invalidate_all_s
+            shape_engine_invalidate_all_s, shape_engine_recompute_count_f
     use beta_parameterization_workers_mod, only: &
             precompute_legendre_table_s, &
             precompute_legendre_derivative_table_s, &
@@ -62,6 +62,11 @@ module beta_parameterization_mod
     public :: cache_n_params_f, cache_n_thetas_f, cache_is_initialized_f
 
     !---------------------------------------------------------------------------
+    ! Cache introspection (test-facing)
+    !---------------------------------------------------------------------------
+    public :: cache_recompute_count_f
+
+    !---------------------------------------------------------------------------
     ! Cached computes
     !---------------------------------------------------------------------------
     public :: cache_resolve_shape_s
@@ -86,8 +91,20 @@ module beta_parameterization_mod
     !---------------------------------------------------------------------------
     ! Cached intermediates tracked by the embedded shape_engine_t
     !---------------------------------------------------------------------------
-    integer(kind = ik), parameter :: I_RESOLVED = 1_ik, I_MIN_RADIUS = 2_ik, &
-            I_VOLUME = 3_ik, I_RADII = 4_ik, I_DERIV = 5_ik, N_INTERMEDIATES = 5_ik
+    !> Test-facing mirrors of the intermediate indices: `cache_recompute_count_f`
+    !! takes one of these. They exist so the contract's minimality suite can name
+    !! what it queries; production code has no reason to use them. The private
+    !! I_* below are defined FROM these, so the two can never drift apart.
+    integer(kind = ik), parameter, public :: BETA_PARAM_I_RESOLVED   = 1_ik
+    integer(kind = ik), parameter, public :: BETA_PARAM_I_MIN_RADIUS = 2_ik
+    integer(kind = ik), parameter, public :: BETA_PARAM_I_VOLUME     = 3_ik
+    integer(kind = ik), parameter, public :: BETA_PARAM_I_RADII      = 4_ik
+    integer(kind = ik), parameter, public :: BETA_PARAM_I_DERIV      = 5_ik
+
+    integer(kind = ik), parameter :: I_RESOLVED = BETA_PARAM_I_RESOLVED, &
+            I_MIN_RADIUS = BETA_PARAM_I_MIN_RADIUS, I_VOLUME = BETA_PARAM_I_VOLUME, &
+            I_RADII = BETA_PARAM_I_RADII, I_DERIV = BETA_PARAM_I_DERIV, &
+            N_INTERMEDIATES = 5_ik
 
     ! Shared contract codes re-exported for consumers
     public :: SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS
@@ -588,6 +605,27 @@ contains
             if (associated(cache%tp)) n = tables_n_thetas_f(cache%tp)
         end if
     end function cache_n_thetas_f
+
+    !> How many times one cached intermediate was recomputed since this cache
+    !! was initialized. Test-facing: the embedded engine is private, and the
+    !! contract's minimality tests need the counters to prove that a compute
+    !! recomputes exactly what its parameter diff invalidated.
+    !!
+    !! Query with the `BETA_PARAM_I_*` constants. Returns 0 for an uninitialized
+    !! cache (its engine carries no counters) and for an out-of-range index.
+    !! Counters accumulate for the whole life of the cache; a failed compute
+    !! returns the engine to cold but never resets them.
+    !!
+    !! @param[in] cache         Cache to query
+    !! @param[in] intermediate  One of the `BETA_PARAM_I_*` indices
+    pure function cache_recompute_count_f(cache, intermediate) result(n)
+        type(cache_t),      intent(in) :: cache
+        integer(kind = ik), intent(in) :: intermediate
+        integer(kind = ikl) :: n
+        n = 0_ikl
+        if (.not. cache%is_initialized) return
+        n = shape_engine_recompute_count_f(cache%engine, intermediate)
+    end function cache_recompute_count_f
 
     !> .true. only after a successful init and before `cache_free_s`.
     pure function cache_is_initialized_f(cache) result(ok)
