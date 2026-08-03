@@ -59,6 +59,7 @@ module beta_parameterization_mod
     !---------------------------------------------------------------------------
     public :: cache_t
     public :: tables_t
+    public :: node_set_t
 
     !---------------------------------------------------------------------------
     ! Public standalone procedures (one-off, build a temporary cache internally)
@@ -70,6 +71,11 @@ module beta_parameterization_mod
     ! Tables lifecycle
     !---------------------------------------------------------------------------
     public :: tables_init_s, tables_free_s, tables_max_l_f, tables_n_thetas_f
+
+    !---------------------------------------------------------------------------
+    ! Node-set lifecycle
+    !---------------------------------------------------------------------------
+    public :: node_set_build_s, node_set_free_s, node_set_n_nodes_f
 
     !---------------------------------------------------------------------------
     ! Public limits
@@ -148,7 +154,6 @@ module beta_parameterization_mod
                               => cache_compute_radius_grid_s
         procedure, pass(self) :: compute_radius_grid_with_com_shift &
                               => cache_compute_radius_grid_with_com_shift_s
-        procedure, pass(self) :: build_node_set => cache_build_node_set_s
         procedure, pass(self) :: resolve_shape  => cache_resolve_shape_s
         procedure, pass(self) :: compute_radius_and_derivative &
                               => cache_compute_radius_and_derivative_s
@@ -159,22 +164,24 @@ module beta_parameterization_mod
     end type cache_t
 
     !> A caller-owned set of theta nodes with precomputed Legendre P_k and P_k'
-    !! tables sized to one cache's max_beta_params. Built once (startup), then
-    !! reused across shapes. Carries no shape data; immutable after build and
-    !! safe to share across threads read-only. Deliberately generic: no
-    !! dense/folding/coulomb vocabulary — the caller owns what a set means.
-    type, public :: node_set_t
+    !! tables sized to one `tables_t`'s max_l. Built once (startup), then reused
+    !! across shapes. Carries no shape data; immutable after build and safe to
+    !! share across threads read-only. Deliberately generic: no dense/folding/
+    !! coulomb vocabulary — the caller owns what a set means.
+    !!
+    !! Invariants:
+    !!   - After a successful `node_set_build_s`: is_built == .true., every
+    !!     allocatable component allocated, max_l == the source tables' max_l.
+    !!   - A failed build leaves the default (unbuilt) state — `intent(out)`.
+    type :: node_set_t
         private
         logical            :: is_built = .false.
         integer(kind = ik) :: n_nodes  = 0_ik
+        integer(kind = ik) :: max_l    = 0_ik
         real(kind = rk), allocatable :: thetas(:)
         real(kind = rk), allocatable :: sin_thetas(:)
         real(kind = rk), allocatable :: legendre_table(:, :)        ! P_k(cos theta_i)
         real(kind = rk), allocatable :: legendre_deriv_table(:, :)  ! P_k'(cos theta_i)
-    contains
-        procedure, pass(self) :: is_built_get => node_set_is_built_get
-        procedure, pass(self) :: n_nodes_get  => node_set_n_nodes_get
-        procedure, pass(self) :: destroy      => node_set_destroy_s
     end type node_set_t
 
     !> Shared immutable level: everything that depends only on `max_l` and the
@@ -328,6 +335,70 @@ contains
     end function tables_n_thetas_f
 
     !===========================================================================
+    ! NODE-SET LIFECYCLE
+    !===========================================================================
+
+    !> Precompute P_k and P_k' tables at caller-supplied theta nodes, sized to
+    !! the source tables' max_l.
+    !!
+    !! Pole nodes are rejected (`BETA_PARAM_ERROR_POLE_NODE`): the derivative
+    !! recurrence divides by 1 - x**2. Pole radii come analytically from the
+    !! resolve step instead.
+    !!
+    !! @param[out] node_set  Filled on success; unbuilt otherwise (intent(out)
+    !!                       resets it on entry)
+    !! @param[in]  tables    Initialized shared tables; supplies max_l
+    !! @param[in]  thetas    Node angles (radians); any order, need not be uniform
+    !! @param[out] status    SHAPE_VALID on success, else the rejecting code
+    subroutine node_set_build_s(node_set, tables, thetas, status)
+        type(node_set_t),   intent(out) :: node_set
+        type(tables_t),     intent(in)  :: tables
+        real(kind = rk),    intent(in)  :: thetas(:)
+        integer(kind = ik), intent(out) :: status
+        real(kind = rk), allocatable :: x(:)
+        integer(kind = ik) :: i, n
+
+        status = SHAPE_VALID
+        if (.not. tables%is_initialized) then
+            status = SHAPE_ERROR_TABLES_NOT_INITIALIZED
+            return
+        end if
+        call validate_theta_set_s(thetas, status)
+        if (status /= SHAPE_VALID) return
+
+        n = size(thetas, kind = ik)
+        node_set%n_nodes = n
+        node_set%max_l = tables%max_l   ! recorded for the consumer-side mismatch check
+        allocate(node_set%thetas(n), node_set%sin_thetas(n), x(n))
+        node_set%thetas = thetas
+        do i = 1_ik, n
+            x(i) = cos(thetas(i))
+            node_set%sin_thetas(i) = sin(thetas(i))
+        end do
+        allocate(node_set%legendre_table(n, tables%max_l + 1_ik))
+        allocate(node_set%legendre_deriv_table(n, tables%max_l + 1_ik))
+        call precompute_legendre_table_s(x, tables%max_l, node_set%legendre_table)
+        call precompute_legendre_derivative_table_s(x, tables%max_l, &
+                node_set%legendre_table, node_set%legendre_deriv_table)
+        node_set%is_built = .true.
+    end subroutine node_set_build_s
+
+    !> Release the node set. Infallible: intent(out) deallocates every component
+    !! and restores the default component values.
+    pure subroutine node_set_free_s(node_set)
+        type(node_set_t), intent(out) :: node_set
+        node_set%is_built = .false.   ! intent(out) already did this; explicit for clarity
+    end subroutine node_set_free_s
+
+    !> Number of nodes in the set; 0 when unbuilt.
+    pure function node_set_n_nodes_f(node_set) result(n)
+        type(node_set_t), intent(in) :: node_set
+        integer(kind = ik) :: n
+        n = 0_ik
+        if (node_set%is_built) n = node_set%n_nodes
+    end function node_set_n_nodes_f
+
+    !===========================================================================
     ! LIFECYCLE
     !===========================================================================
 
@@ -453,96 +524,6 @@ contains
         b = self%is_initialized
     end function
 
-    !===========================================================================
-    ! NODE SETS
-    !===========================================================================
-
-    pure function node_set_is_built_get(self) result(b)
-        class(node_set_t), intent(in) :: self
-        logical :: b
-        b = self%is_built
-    end function node_set_is_built_get
-
-    pure function node_set_n_nodes_get(self) result(n)
-        class(node_set_t), intent(in) :: self
-        integer(kind = ik) :: n
-        n = self%n_nodes
-    end function node_set_n_nodes_get
-
-    !> Deallocate all components and reset flags. Safe on an unbuilt set.
-    pure subroutine node_set_destroy_s(self)
-        class(node_set_t), intent(inout) :: self
-        if (allocated(self%thetas))               deallocate(self%thetas)
-        if (allocated(self%sin_thetas))           deallocate(self%sin_thetas)
-        if (allocated(self%legendre_table))       deallocate(self%legendre_table)
-        if (allocated(self%legendre_deriv_table)) deallocate(self%legendre_deriv_table)
-        self%is_built = .false.
-        self%n_nodes  = 0_ik
-    end subroutine node_set_destroy_s
-
-    !> Precompute P_k and P_k' tables at caller-supplied theta nodes.
-    !!
-    !! Pole nodes (1 - cos(theta)**2 == 0 in double precision) are rejected with
-    !! LEGENDRE_ERROR_POLE_NODE: the derivative recursion divides by 1 - x**2.
-    !! Gauss-Legendre nodes never land there; pole radii come analytically from
-    !! resolve_shape instead.
-    !!
-    !! @param[in]  thetas      Node angles (radians); any order, need not be uniform
-    !! @param[out] node_set    Filled tables (intent(out) resets any prior build)
-    !! @param[out] error_code  LEGENDRE_VALID on success
-    !! @param[out] message     Empty on success
-    subroutine cache_build_node_set_s(self, thetas, node_set, error_code, message)
-
-        class(cache_t),     intent(in)  :: self
-        real(kind = rk),    intent(in)  :: thetas(:)
-        type(node_set_t),   intent(out) :: node_set
-        integer(kind = ik), intent(out) :: error_code
-        character(len = *), intent(out) :: message
-
-        integer(kind = ik) :: n, i
-        real(kind = rk), allocatable :: x(:)
-
-        error_code = LEGENDRE_VALID
-        message    = ''
-
-        if (.not. self%is_initialized) then
-            error_code = LEGENDRE_ERROR_INVALID_MAX_PARAMS  ! reuse — API misuse, like cache_init_s
-            message    = 'build_node_set: cache not initialized'
-            return
-        end if
-
-        n = size(thetas, kind = ik)
-        if (n < 1_ik) then
-            error_code = LEGENDRE_ERROR_INVALID_BUFFER_SIZE
-            message    = 'build_node_set: thetas is empty'
-            return
-        end if
-
-        allocate(x(n))
-        x = cos(thetas)
-        do i = 1_ik, n
-            if (1.0_rk - x(i)**2 <= 0.0_rk) then
-                error_code = LEGENDRE_ERROR_POLE_NODE
-                write(message, '(A,ES12.4,A)') &
-                        'build_node_set: node at theta = ', thetas(i), &
-                        ' is a pole; use resolve_shape polar radii instead'
-                return
-            end if
-        end do
-
-        node_set%n_nodes = n
-        allocate(node_set%thetas(n), node_set%sin_thetas(n))
-        node_set%thetas     = thetas
-        node_set%sin_thetas = sin(thetas)
-        allocate(node_set%legendre_table(n, self%max_beta_params + 1_ik))
-        allocate(node_set%legendre_deriv_table(n, self%max_beta_params + 1_ik))
-        call precompute_legendre_table_s(x, self%max_beta_params, node_set%legendre_table)
-        call precompute_legendre_derivative_table_s(x, self%max_beta_params, &
-                node_set%legendre_table, node_set%legendre_deriv_table)
-        node_set%is_built = .true.
-
-    end subroutine cache_build_node_set_s
-
     !> Resolve a shape once: pad + normalize params, run the COM iteration,
     !! polar pre-check. Node-set-independent — feed the resulting beta_con to
     !! compute_radius_and_derivative for any number of node sets.
@@ -664,7 +645,7 @@ contains
     !!
     !! @param[in]  beta_con    Resolved coefficients from resolve_shape;
     !!                         size must equal cache max_beta_params
-    !! @param[in]  node_set    Built by this cache's build_node_set
+    !! @param[in]  node_set    Built by node_set_build_s from matching tables
     !! @param[out] radii       R(theta_i); size must equal node set n_nodes
     !! @param[out] dr_dthetas  dR/dtheta(theta_i); size must equal node set n_nodes
     !! @param[out] error_code  LEGENDRE_VALID on success

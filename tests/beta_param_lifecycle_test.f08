@@ -4,11 +4,14 @@ program beta_param_lifecycle_test
     use test_utils_mod, only: assert_true, assert_int_eq, test_summary
     use beta_parameterization_mod, only: &
             tables_t, tables_init_s, tables_free_s, tables_max_l_f, tables_n_thetas_f, &
+            node_set_t, node_set_build_s, node_set_free_s, node_set_n_nodes_f, &
             SHAPE_VALID, SHAPE_ERROR_INVALID_GRID, SHAPE_ERROR_INVALID_INIT, &
+            SHAPE_ERROR_TABLES_NOT_INITIALIZED, &
             BETA_PARAM_ERROR_POLE_NODE
     implicit none
 
     call run_tables_tests_s()
+    call run_node_set_tests_s()
     call test_summary()
 
 contains
@@ -46,5 +49,35 @@ contains
         call tables_init_s(tables, 4_ik, thetas4, status)
         call assert_int_eq(status, BETA_PARAM_ERROR_POLE_NODE, 'rounded-cosine pole rejected')
     end subroutine run_tables_tests_s
+
+    subroutine run_node_set_tests_s()
+        type(tables_t)   :: tables
+        type(node_set_t) :: ns
+        integer(kind = ik) :: status, i
+        real(kind = rk) :: thetas6(6), nodes3(3)
+
+        do i = 1_ik, 6_ik
+            thetas6(i) = real(i, rk) * PI_C / 7.0_rk
+        end do
+        nodes3 = [0.3_rk, 1.1_rk, 2.6_rk]
+
+        call node_set_build_s(ns, tables, nodes3, status)
+        call assert_int_eq(status, SHAPE_ERROR_TABLES_NOT_INITIALIZED, &
+                'node set from uninitialized tables rejected')
+        call assert_int_eq(node_set_n_nodes_f(ns), 0_ik, 'failed build leaves unbuilt')
+
+        call tables_init_s(tables, 6_ik, thetas6, status)
+        call node_set_build_s(ns, tables, nodes3, status)
+        call assert_int_eq(status, SHAPE_VALID, 'node set builds')
+        call assert_int_eq(node_set_n_nodes_f(ns), 3_ik, 'n_nodes getter')
+
+        nodes3(2) = PI_C
+        call node_set_build_s(ns, tables, nodes3, status)
+        call assert_int_eq(status, BETA_PARAM_ERROR_POLE_NODE, 'pole node rejected')
+
+        call node_set_free_s(ns)
+        call tables_free_s(tables)
+        call assert_int_eq(node_set_n_nodes_f(ns), 0_ik, 'freed set reports 0')
+    end subroutine run_node_set_tests_s
 
 end program beta_param_lifecycle_test
