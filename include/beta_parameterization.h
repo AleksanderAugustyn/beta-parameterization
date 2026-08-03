@@ -1,32 +1,51 @@
 /**
  * @file beta_parameterization.h
- * @brief C API for the Fortran beta parameterization library (v2.2.0).
+ * @brief C API for the Fortran beta parameterization library (v3.0.0).
  *
- * Two-tier API:
- *   - Cache-backed (recommended for batch use): create one cache up front,
- *     reuse it across many shape evaluations. The cache is immutable after
- *     creation and safe to share across threads.
- *   - Standalone single-shape (one-off, inefficient for batch): builds and
- *     discards a cache internally per call.
+ * Three handle types, from shared to per-shape:
+ *   - `beta_param_tables_t`   — everything determined by `max_l` and the
+ *     primary theta set (normalization constants, Gauss-Legendre tables,
+ *     Legendre tables at the primary thetas). Built once, shared read-only.
+ *   - `beta_param_node_set_t` — an extra set of evaluation thetas with its own
+ *     Legendre tables, sized to one tables handle. Immutable after creation.
+ *   - `beta_param_cache_t`    — per-shape working state: the recompute engine
+ *     and every per-shape buffer. Mutated by every compute call.
  *
- * All radius-grid functions return a status code; 0 (BETA_PARAM_VALID) means
- * success. The message buffer is always null-terminated (truncated to fit
- * if needed). Recommended buffer size: 256.
+ * Two tiers of computation:
+ *   - Cached: create a cache once, call the `beta_param_cache_*` functions for
+ *     many shapes. Only the intermediates invalidated by the changed
+ *     parameters are recomputed.
+ *   - Standalone: one-off calls that build, use and discard their own tables.
  *
- * Status-code notes:
- *   BETA_PARAM_ERROR_INVALID_MAX_PARAMS (5) covers every invalid cache-init
- *   parameter (max_beta_params outside [1, 64] or n_grid < 2), a NULL cache
- *   handle passed to a compute function, and - through the standalone entry
- *   points, where max_beta_params is taken as n_params - an empty params
- *   array. On any failure, output buffers (radii, corrected_beta10) are
- *   zero-filled.
+ * Thread safety (BREAKING CHANGE at 3.0.0 — the 2.x promise is withdrawn):
+ *   A `beta_param_cache_t*` is THREAD-CONFINED. It is mutated by every compute
+ *   call; concurrent use of one cache from more than one thread is undefined.
+ *   Give every thread its own cache. `beta_param_tables_t*` and
+ *   `beta_param_node_set_t*` are immutable after creation and may be shared
+ *   across threads for concurrent reads, including as the backing tables of
+ *   per-thread caches created with beta_param_cache_create_shared().
  *
- * Thread safety:
- *   A `beta_param_cache_t*` is immutable after `beta_param_cache_create`.
- *   Multiple threads may concurrently call any combination of the
- *   `beta_param_cache_compute_*` functions on the same cache. Only
- *   `beta_param_cache_create` and `beta_param_cache_destroy` require
- *   exclusive access.
+ * Lifetime:
+ *   A tables handle passed to beta_param_cache_create_shared() or
+ *   beta_param_node_set_create() MUST outlive every cache and node set built
+ *   from it — the cache/node set holds a reference, not a copy. Destroy order:
+ *   node sets and caches first, their tables last.
+ *
+ * Diagnostics:
+ *   There are no message buffers. `_create` functions return NULL on failure
+ *   and write the reason to the nullable `int* status` out-parameter (pass
+ *   NULL to ignore it). Every other function returns the status code directly;
+ *   BETA_PARAM_VALID (0) means success. beta_param_status_message() maps a code
+ *   to a fixed, static, null-terminated string; the returned pointer is owned
+ *   by the library, never freed by the caller, and is safe to read from any
+ *   thread.
+ *
+ * Failure behavior:
+ *   On any nonzero status from a compute function, every output buffer is
+ *   zero-filled and the cache is returned to a cold state — the next call
+ *   recomputes from scratch. No partially updated results are ever visible.
+ *   A NULL handle passed into a compute function returns
+ *   BETA_PARAM_ERROR_CACHE_NOT_INITIALIZED (2).
  */
 
 #ifndef BETA_PARAMETERIZATION_H
@@ -37,168 +56,193 @@ extern "C" {
 #endif
 
 /* --- Limits --- */
+/** Highest Legendre order a tables handle may be built for. */
 #define BETA_PARAM_MAX_PARAMS_LIMIT 64
+/** Highest n_params a cache (cached tier) accepts. */
+#define BETA_PARAM_CACHE_MAX_PARAMS 8
 
-/* --- Status codes (mirror Fortran LEGENDRE_* parameters) --- */
-#define BETA_PARAM_VALID                     0
-#define BETA_PARAM_ERROR_NORTH_POLE          1
-#define BETA_PARAM_ERROR_SOUTH_POLE          2
-#define BETA_PARAM_ERROR_EMPTY_PARAMS        3
-#define BETA_PARAM_ERROR_INTERIOR_NEGATIVE   4
-#define BETA_PARAM_ERROR_INVALID_MAX_PARAMS  5
-#define BETA_PARAM_ERROR_TOO_MANY_PARAMS     6
-#define BETA_PARAM_ERROR_COM_NOT_CONVERGED   7
-#define BETA_PARAM_ERROR_INVALID_BUFFER_SIZE 8
-#define BETA_PARAM_ERROR_POLE_NODE           9
-#define BETA_PARAM_ERROR_NO_UNIFORM_GRID     10
+/* --- Shared contract status codes (0-99, identical numbers in every
+ *     shape-parameterization library) --- */
+#define BETA_PARAM_VALID                        0
+#define BETA_PARAM_ERROR_TOO_MANY_PARAMS        1
+#define BETA_PARAM_ERROR_CACHE_NOT_INITIALIZED  2
+#define BETA_PARAM_ERROR_INVALID_GRID           3
+#define BETA_PARAM_ERROR_WRONG_PARAM_COUNT      4
+#define BETA_PARAM_ERROR_INVALID_INIT           5
+#define BETA_PARAM_ERROR_TABLES_NOT_INITIALIZED 6
 
-/* --- Opaque cache handle --- */
+/* --- Library status codes (>= 100, append-only after 3.0.0) --- */
+#define BETA_PARAM_ERROR_NORTH_POLE          100
+#define BETA_PARAM_ERROR_SOUTH_POLE          101
+#define BETA_PARAM_ERROR_INTERIOR_NEGATIVE   102
+#define BETA_PARAM_ERROR_COM_NOT_CONVERGED   103
+#define BETA_PARAM_ERROR_INVALID_BUFFER_SIZE 104
+#define BETA_PARAM_ERROR_POLE_NODE           105
+#define BETA_PARAM_ERROR_NODE_SET_MISMATCH   106
+
+/* --- Opaque handles --- */
+typedef struct beta_param_tables beta_param_tables_t;
 typedef struct beta_param_cache beta_param_cache_t;
-
-/* --- Opaque node-set handle (precomputed Legendre tables at fixed thetas) --- */
 typedef struct beta_param_node_set beta_param_node_set_t;
+
+/* --- Diagnostics --- */
+
+/**
+ * Fixed description of a status code. Never NULL; unknown codes map to an
+ * "unknown status code" string. The pointer is to static storage: do not free
+ * it, and it stays valid for the life of the process.
+ */
+const char* beta_param_status_message(int status);
+
+/* --- Tables lifecycle --- */
+
+/**
+ * Build the shared immutable level. Returns NULL on failure.
+ *
+ * @param max_l     1 .. BETA_PARAM_MAX_PARAMS_LIMIT
+ * @param thetas    Primary theta set in radians; at least 2 entries, none at
+ *                  or beyond a pole (cos(theta)^2 == 1 in double precision)
+ * @param n_thetas  Number of entries in thetas
+ * @param status    Nullable; receives BETA_PARAM_VALID or the rejecting code
+ */
+beta_param_tables_t* beta_param_tables_create(
+        int max_l, const double* thetas, int n_thetas, int* status);
+
+/** Destroy a tables handle. NULL-safe. Every cache and node set built from it
+ *  must already be destroyed. */
+void beta_param_tables_destroy(beta_param_tables_t* tables);
 
 /* --- Cache lifecycle --- */
 
 /**
- * Create a cache. Returns NULL on failure (reason in message_buf).
+ * Create a cache that owns private tables built with max_l = n_params.
+ * Returns NULL on failure.
  *
- * @param max_beta_params  1 .. BETA_PARAM_MAX_PARAMS_LIMIT
- * @param n_grid           Number of θ grid points (>= 2). n_grid <= 0 builds a
- *                         node-set-only cache: the uniform-grid entry points
- *                         (beta_param_cache_compute_radius_grid[_with_com_shift])
- *                         then return BETA_PARAM_ERROR_NO_UNIFORM_GRID; the
- *                         node-set API is unaffected.
- * @param message_buf_len  Size of message_buf including null terminator
- * @param message_buf      Buffer to receive failure reason (empty on success)
+ * @param n_params         1 .. BETA_PARAM_CACHE_MAX_PARAMS; the exact length
+ *                         every later params array must have
+ * @param thetas           Primary theta set in radians (see tables_create)
+ * @param n_thetas         Number of entries in thetas
+ * @param conserve_volume  Nonzero: rescale radii to fixed volume
+ * @param apply_com        Nonzero: apply the centre-of-mass correction
+ * @param status           Nullable; receives the rejecting code on failure
  */
 beta_param_cache_t* beta_param_cache_create(
-        int max_beta_params, int n_grid,
-        int message_buf_len, char* message_buf);
+        int n_params, const double* thetas, int n_thetas,
+        int conserve_volume, int apply_com, int* status);
 
-/** Destroy a cache. Null-safe. */
+/**
+ * Create a cache over caller-owned shared tables. Returns NULL on failure.
+ * The tables handle MUST outlive the cache; it is referenced, not copied, and
+ * beta_param_cache_destroy() never frees it.
+ *
+ * @param tables           Tables handle; n_params must not exceed its max_l
+ * @param n_params         1 .. BETA_PARAM_CACHE_MAX_PARAMS
+ * @param conserve_volume  Nonzero: rescale radii to fixed volume
+ * @param apply_com        Nonzero: apply the centre-of-mass correction
+ * @param status           Nullable; receives the rejecting code on failure
+ */
+beta_param_cache_t* beta_param_cache_create_shared(
+        const beta_param_tables_t* tables, int n_params,
+        int conserve_volume, int apply_com, int* status);
+
+/** Destroy a cache. NULL-safe. Shared tables are left untouched. */
 void beta_param_cache_destroy(beta_param_cache_t* cache);
 
-/* --- Cache hot path --- */
+/* --- Node-set lifecycle --- */
 
 /**
- * Compute R(θ) on the cache's θ grid.
+ * Build an extra evaluation set (thetas plus Legendre P_k and P_k' tables)
+ * sized to `tables`. Returns NULL on failure — including a pole node, which is
+ * rejected with BETA_PARAM_ERROR_POLE_NODE; use the resolve_shape polar radii
+ * for the poles instead.
  *
- * @param cache            Cache (must be non-NULL)
- * @param params           Deformation parameters β₁..βₙ
- * @param n_params         Number of deformation parameters
- * @param radii            Output buffer; must hold at least cache's n_grid doubles
- * @param message_buf_len  Size of message_buf
- * @param message_buf      Buffer to receive validation message (empty on success)
- * @return                 BETA_PARAM_VALID (0) on success, error code otherwise
- */
-int beta_param_cache_compute_radius_grid(
-        const beta_param_cache_t* cache,
-        const double* params, int n_params,
-        double* radii,
-        int message_buf_len, char* message_buf);
-
-/**
- * Compute R(θ) with COM shift applied to β₁₀ first.
- * `corrected_beta10` receives the post-shift β₁₀.
- */
-int beta_param_cache_compute_radius_grid_with_com_shift(
-        const beta_param_cache_t* cache,
-        const double* params, int n_params,
-        double* radii, double* corrected_beta10,
-        int message_buf_len, char* message_buf);
-
-/* --- Node-set API (arbitrary thetas, R + analytic dR/dtheta) --- */
-
-/**
- * Build a node set: precomputed Legendre P_k and P_k' tables at the given
- * thetas, sized to the cache's max_beta_params. Returns NULL on failure
- * (reason in message_buf) — including any pole node (theta where
- * cos(theta)^2 == 1 in double precision), which is rejected with
- * BETA_PARAM_ERROR_POLE_NODE; use the resolve_shape polar radii instead.
- *
- * Thread safety: a node set is immutable after create; multiple threads may
- * concurrently pass it to beta_param_cache_compute_radius_and_derivative.
- *
- * @param cache            Cache the tables are sized to (must be non-NULL)
- * @param thetas           Node angles in radians (need not be uniform)
- * @param n_thetas         Number of nodes (>= 1)
- * @param message_buf_len  Size of message_buf including null terminator
- * @param message_buf      Buffer to receive failure reason (empty on success)
+ * @param tables    Tables handle; must outlive the node set
+ * @param thetas    Node angles in radians; any order, need not be uniform
+ * @param n_thetas  Number of nodes (at least 2)
+ * @param status    Nullable; receives the rejecting code on failure
  */
 beta_param_node_set_t* beta_param_node_set_create(
-        const beta_param_cache_t* cache, const double* thetas, int n_thetas,
-        int message_buf_len, char* message_buf);
+        const beta_param_tables_t* tables, const double* thetas, int n_thetas,
+        int* status);
 
-/** Destroy a node set. Null-safe. */
+/** Destroy a node set. NULL-safe. */
 void beta_param_node_set_destroy(beta_param_node_set_t* node_set);
 
-/**
- * Resolve a shape once: pad + normalize params, run the COM iteration,
- * polar pre-check. Node-set-independent — feed the resulting beta_con to
- * beta_param_cache_compute_radius_and_derivative for any number of node sets.
- * On failure all outputs are zero-filled.
+/* --- Cached computes ---
  *
- * @param cache             Cache (must be non-NULL)
- * @param params            Deformation parameters (beta10 is the COM dipole)
- * @param n_params          Number of deformation parameters
- * @param beta_con          Output; must hold at least the cache's max_beta_params doubles
- * @param corrected_beta10  Receives the post-shift beta10
- * @param r_north           Receives analytic R(0)
- * @param r_south           Receives analytic R(pi)
- * @param apply_com_correction  Nonzero (default behavior): run the COM
- *                              iteration. Zero: skip it; corrected_beta10
- *                              receives the input beta10 (no-COM semantics
- *                              of beta_param_compute_radius_grid).
- * @param message_buf_len   Size of message_buf
- * @param message_buf       Buffer to receive validation message (empty on success)
- * @return                  BETA_PARAM_VALID (0) on success, error code otherwise
+ * Every one of these mutates the cache (thread-confined, see above). `params`
+ * must hold exactly the cache's n_params entries, else
+ * BETA_PARAM_ERROR_WRONG_PARAM_COUNT. Output buffer lengths must equal the
+ * cache's theta count (or the node set's node count), else
+ * BETA_PARAM_ERROR_INVALID_BUFFER_SIZE. Radii and derivatives are
+ * COM-corrected and volume-scaled per the cache's flags.
+ */
+
+/** R(theta) at the cache's primary thetas. `n_radii` must equal that count. */
+int beta_param_cache_radius_grid(
+        beta_param_cache_t* cache, const double* params, int n_params,
+        double* radii, int n_radii);
+
+/** R(theta) and dR/dtheta at the cache's primary thetas. */
+int beta_param_cache_radius_and_derivative(
+        beta_param_cache_t* cache, const double* params, int n_params,
+        double* radii, double* dr_dthetas, int n_radii);
+
+/**
+ * R(theta) at the primary thetas with NO validation gates and NO volume
+ * scaling — the rendering/diagnostic path. It reports usage errors only (not
+ * initialized, wrong parameter count, buffer size, COM non-convergence), so a
+ * shape rejected by the checked path still yields its (partly negative)
+ * outline instead of a zero-filled buffer.
+ */
+int beta_param_cache_radius_grid_unchecked(
+        beta_param_cache_t* cache, const double* params, int n_params,
+        double* radii, int n_radii);
+
+/**
+ * Resolve a shape without evaluating a grid: the COM-corrected beta10, the
+ * analytic polar radii, and the applied volume factor.
+ *
+ * `corrected_beta10` is a beta-space value and is never volume-scaled;
+ * `r_north` and `r_south` are scaled. `volume_factor` is exactly 1.0 when the
+ * cache was created with conserve_volume = 0.
  */
 int beta_param_cache_resolve_shape(
-        const beta_param_cache_t* cache, const double* params, int n_params,
-        double* beta_con, double* corrected_beta10, double* r_north, double* r_south,
-        int apply_com_correction, int message_buf_len, char* message_buf);
+        beta_param_cache_t* cache, const double* params, int n_params,
+        double* corrected_beta10, double* r_north, double* r_south,
+        double* volume_factor);
 
 /**
- * Evaluate R and dR/dtheta at a node set for a shape already resolved by
- * beta_param_cache_resolve_shape. Dot products only — no iteration.
- * On failure radii and dr_dtheta are zero-filled.
- *
- * @param cache            Cache (must be non-NULL)
- * @param node_set         Node set built by this cache (must be non-NULL)
- * @param beta_con         Resolved coefficients; n_beta_con must equal the
- *                         cache's max_beta_params
- * @param n_beta_con       Number of beta_con entries
- * @param radii            Output R(theta_i); n_nodes doubles
- * @param dr_dtheta        Output dR/dtheta(theta_i); n_nodes doubles
- * @param n_nodes          Must equal the node set's node count
- * @param message_buf_len  Size of message_buf
- * @param message_buf      Buffer to receive validation message (empty on success)
- * @return                 BETA_PARAM_VALID (0) on success, error code otherwise
+ * R(theta) and dR/dtheta at a node set's thetas. The node set must be built
+ * from tables whose max_l is at least the cache's n_params, else
+ * BETA_PARAM_ERROR_NODE_SET_MISMATCH. `n_nodes` must equal the node set's node
+ * count. This evaluation is not cached; the resolve/validation/volume
+ * intermediates behind it are.
  */
-int beta_param_cache_compute_radius_and_derivative(
-        const beta_param_cache_t* cache, const beta_param_node_set_t* node_set,
-        const double* beta_con, int n_beta_con,
-        double* radii, double* dr_dtheta, int n_nodes,
-        int message_buf_len, char* message_buf);
+int beta_param_cache_node_radius_and_derivative(
+        beta_param_cache_t* cache, const beta_param_node_set_t* node_set,
+        const double* params, int n_params,
+        double* radii, double* dr_dthetas, int n_nodes);
 
-/* --- Standalone single-shape (one-off, inefficient for batch) ---
+/* --- Standalone computes (tier 1) ---
  *
- * Return BETA_PARAM_VALID (0) on success, an error code otherwise.
- * max_beta_params is taken as n_params, so n_params must be in [1, 64]
- * and n_grid >= 2; violations return BETA_PARAM_ERROR_INVALID_MAX_PARAMS.
- * On failure, radii (and corrected_beta10) are zero-filled.
+ * One-off: tables are built, used and discarded per call — no handle, nothing
+ * to free, no engine. `n_params` may be 1 .. BETA_PARAM_MAX_PARAMS_LIMIT (the
+ * cached-tier cap does not apply); above that,
+ * BETA_PARAM_ERROR_TOO_MANY_PARAMS, never silent truncation. Output buffers
+ * hold n_thetas doubles. Outputs are zero-filled on failure.
  */
 
-int beta_param_compute_radius_grid_standalone(
-        const double* params, int n_params, int n_grid,
-        double* radii,
-        int message_buf_len, char* message_buf);
+int beta_param_radius_grid_standalone(
+        const double* params, int n_params,
+        const double* thetas, int n_thetas,
+        int conserve_volume, int apply_com, double* radii);
 
-int beta_param_compute_radius_grid_standalone_with_com_shift(
-        const double* params, int n_params, int n_grid,
-        double* radii, double* corrected_beta10,
-        int message_buf_len, char* message_buf);
+int beta_param_radius_and_derivative_standalone(
+        const double* params, int n_params,
+        const double* thetas, int n_thetas,
+        int conserve_volume, int apply_com,
+        double* radii, double* dr_dthetas);
 
 #ifdef __cplusplus
 }

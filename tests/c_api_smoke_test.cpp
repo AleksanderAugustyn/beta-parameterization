@@ -1,213 +1,212 @@
-// Smoke test for the C API (raw) and the C++20 RAII wrapper.
-// Exercises the SHARED library — the same binary the Python bindings load.
+// Smoke test for the 3.0.0 C API (raw C surface only — the C++ RAII wrapper
+// has its own suite). Exercises the SHARED library: the same binary the Python
+// bindings load.
+//
+// Scope: every prototype in the header is called at least once on its happy
+// path, plus the three failure modes the C layer itself owns — create failure
+// with a status out-parameter, NULL handles into computes, and the static
+// status-message strings.
 #include "beta_parameterization.h"
-#include "beta_parameterization.hpp"
 
-#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <numbers>
 #include <string>
 #include <vector>
 
 namespace {
 int failures = 0;
 
-void check(bool ok, const char* label) {
+void check(const bool ok, const char* label) {
     if (!ok) {
         std::printf("FAIL: %s\n", label);
         ++failures;
     }
 }
+
+// Open uniform grid theta_i = i*pi/(n+1), i = 1..n — no pole nodes.
+std::vector<double> open_theta_grid(const int n) {
+    std::vector<double> thetas(static_cast<std::size_t>(n));
+    for (int i = 1; i <= n; ++i) {
+        thetas[static_cast<std::size_t>(i - 1)] =
+                static_cast<double>(i) * std::numbers::pi / static_cast<double>(n + 1);
+    }
+    return thetas;
+}
+
+bool all_positive(const std::vector<double>& v) {
+    for (const double x : v) {
+        if (!(x > 0.0)) return false;
+    }
+    return true;
+}
 }  // namespace
 
 int main() {
-    std::array<char, 256> buf{};
+    constexpr int n_thetas = 32;
+    constexpr int max_l = 8;
+    const std::vector<double> thetas = open_theta_grid(n_thetas);
+    const std::vector<double> params{0.0, 0.25, 0.10, 0.05};
+    const int n_params = static_cast<int>(params.size());
 
-    // --- Raw C API ---
-    check(beta_param_cache_create(0, 181, static_cast<int>(buf.size()), buf.data()) == nullptr,
-          "C: create with max_beta_params=0 returns NULL");
-    check(buf[0] != '\0', "C: failure message is non-empty");
+    // --- Tables ---
+    int status = -1;
+    beta_param_tables_t* tables =
+            beta_param_tables_create(max_l, thetas.data(), n_thetas, &status);
+    check(tables != nullptr, "tables_create succeeds");
+    check(status == BETA_PARAM_VALID, "tables_create reports VALID");
 
-    beta_param_cache_t* cache = beta_param_cache_create(8, 181, static_cast<int>(buf.size()), buf.data());
-    check(cache != nullptr, "C: create(8, 181) succeeds");
+    // NULL status pointer is accepted (nullable out-parameter).
+    beta_param_tables_t* tables_no_status =
+            beta_param_tables_create(max_l, thetas.data(), n_thetas, nullptr);
+    check(tables_no_status != nullptr, "tables_create accepts a NULL status pointer");
+    beta_param_tables_destroy(tables_no_status);
 
-    std::vector<double> params{0.0, 0.25, 0.10, 0.05};
-    std::vector<double> radii(181, -1.0);
-    int s = beta_param_cache_compute_radius_grid(
-            cache, params.data(), static_cast<int>(params.size()),
-            radii.data(), static_cast<int>(buf.size()), buf.data());
-    check(s == BETA_PARAM_VALID, "C: compute returns VALID");
-    // R(0) = 1 + sum(beta_l * N_l), N_l = sqrt((2l+1)/(4pi)), 4pi = 16*atan(1).
-    const double r0_expected = 1.0
-            + 0.25 * std::sqrt(5.0 / (16.0 * std::atan(1.0)))
-            + 0.10 * std::sqrt(7.0 / (16.0 * std::atan(1.0)))
-            + 0.05 * std::sqrt(9.0 / (16.0 * std::atan(1.0)));
-    check(std::fabs(radii[0] - r0_expected) < 1e-12, "C: R(0) matches analytic pole sum");
+    // Pole node in the theta set is rejected; the handle is NULL.
+    const double pole_thetas[2] = {0.0, 1.0};
+    status = -1;
+    beta_param_tables_t* bad_tables =
+            beta_param_tables_create(max_l, pole_thetas, 2, &status);
+    check(bad_tables == nullptr, "tables_create rejects a pole node with a NULL handle");
+    check(status == BETA_PARAM_ERROR_POLE_NODE, "tables_create pole node -> code 105");
 
-    std::vector<double> too_many(9, 0.1);
-    s = beta_param_cache_compute_radius_grid(
-            cache, too_many.data(), 9, radii.data(), static_cast<int>(buf.size()), buf.data());
-    check(s == BETA_PARAM_ERROR_TOO_MANY_PARAMS, "C: 9 params on max-8 cache -> code 6");
+    // --- Caches: shared (tables-backed) and private, both flag combinations ---
+    status = -1;
+    beta_param_cache_t* shared_cache =
+            beta_param_cache_create_shared(tables, n_params, 1, 1, &status);
+    check(shared_cache != nullptr, "cache_create_shared succeeds");
+    check(status == BETA_PARAM_VALID, "cache_create_shared reports VALID");
 
-    // Message truncation: tiny buffer must still be null-terminated within bounds.
-    std::array<char, 8> tiny{};
-    tiny.fill('X');
-    s = beta_param_cache_compute_radius_grid(
-            cache, too_many.data(), 9, radii.data(), static_cast<int>(tiny.size()), tiny.data());
-    check(std::memchr(tiny.data(), '\0', tiny.size()) != nullptr,
-          "C: truncated message is null-terminated within the buffer");
+    status = -1;
+    beta_param_cache_t* plain_cache = beta_param_cache_create(
+            n_params, thetas.data(), n_thetas, 0, 0, &status);
+    check(plain_cache != nullptr, "cache_create succeeds");
+    check(status == BETA_PARAM_VALID, "cache_create reports VALID");
 
-    // Standalone bit-parity contract: standalone(params) equals a cache built
-    // with max_beta_params = n_params. (A max=8 cache differs by <= 1 ulp at
-    // some grid points — the FF norm-constant tables are max-dependent in the
-    // last bit — so parity is defined against the same-max cache.)
-    beta_param_cache_t* cache4 = beta_param_cache_create(4, 181, static_cast<int>(buf.size()), buf.data());
-    check(cache4 != nullptr, "C: create(4, 181) succeeds");
-    beta_param_cache_compute_radius_grid(cache4, params.data(), static_cast<int>(params.size()),
-                                         radii.data(), static_cast<int>(buf.size()), buf.data());
-    std::vector<double> radii_sa(181, -1.0);
-    s = beta_param_compute_radius_grid_standalone(
-            params.data(), static_cast<int>(params.size()), 181,
-            radii_sa.data(), static_cast<int>(buf.size()), buf.data());
-    check(s == BETA_PARAM_VALID, "C: standalone VALID");
-    bool identical = true;
-    for (int i = 0; i < 181; ++i) identical = identical && (radii_sa[i] == radii[i]);
-    check(identical, "C: standalone bit-identical to same-max cache path");
-    beta_param_cache_destroy(cache4);
+    beta_param_cache_t* cache_no_status = beta_param_cache_create(
+            n_params, thetas.data(), n_thetas, 1, 0, nullptr);
+    check(cache_no_status != nullptr, "cache_create accepts a NULL status pointer");
+    beta_param_cache_destroy(cache_no_status);
 
-    // Regression for review finding F1 (seed S-A): failed standalone must
-    // write zeros, not garbage.
-    std::vector<double> radii_fail(41, -7.0);
-    s = beta_param_compute_radius_grid_standalone(
-            params.data(), 0, 41, radii_fail.data(), static_cast<int>(buf.size()), buf.data());
-    check(s != BETA_PARAM_VALID, "C: standalone with n_params=0 fails");
-    bool all_defined = true;
-    for (double r : radii_fail) all_defined = all_defined && (r == 0.0);
-    check(all_defined, "C: failed standalone writes zeros, not garbage (F1 regression)");
+    // Failed create: n_params above the cached-tier cap.
+    status = -1;
+    beta_param_cache_t* too_many = beta_param_cache_create(
+            9, thetas.data(), n_thetas, 0, 0, &status);
+    check(too_many == nullptr, "cache_create with n_params=9 returns NULL");
+    check(status == BETA_PARAM_ERROR_TOO_MANY_PARAMS,
+          "cache_create with n_params=9 reports TOO_MANY_PARAMS");
 
-    beta_param_cache_destroy(cache);
-    beta_param_cache_destroy(nullptr);   // null-safe by contract
+    // --- Node set ---
+    const std::vector<double> node_thetas{0.4, 1.5707963267948966, 2.7};
+    status = -1;
+    beta_param_node_set_t* nodes = beta_param_node_set_create(
+            tables, node_thetas.data(), static_cast<int>(node_thetas.size()), &status);
+    check(nodes != nullptr, "node_set_create succeeds");
+    check(status == BETA_PARAM_VALID, "node_set_create reports VALID");
 
-    // --- Node-set-only cache: n_grid <= 0 sentinel ---
-    beta_param_cache_t* lean = beta_param_cache_create(
-            8, 0, static_cast<int>(buf.size()), buf.data());
-    check(lean != nullptr, "C: create(8, 0) node-set-only cache succeeds");
-    s = beta_param_cache_compute_radius_grid(
-            lean, params.data(), static_cast<int>(params.size()),
-            radii.data(), static_cast<int>(buf.size()), buf.data());
-    check(s == BETA_PARAM_ERROR_NO_UNIFORM_GRID,
-          "C: uniform entry point on node-set-only cache -> code 10");
-    check(buf[0] != '\0', "C: NO_UNIFORM_GRID message is non-empty");
-    beta_param_cache_destroy(lean);
+    // --- Cached computes (happy path) ---
+    std::vector<double> radii(n_thetas, -1.0);
+    int s = beta_param_cache_radius_grid(
+            shared_cache, params.data(), n_params, radii.data(), n_thetas);
+    check(s == BETA_PARAM_VALID, "cache_radius_grid VALID");
+    check(all_positive(radii), "cache_radius_grid radii positive");
 
-    // --- C++ wrapper ---
-    bool threw = false;
-    try {
-        beta_param::Cache bad(0, 181);
-    } catch (const std::runtime_error&) {
-        threw = true;
-    }
-    check(threw, "hpp: constructor throws on invalid max_beta_params");
+    std::vector<double> radii2(n_thetas, -1.0);
+    std::vector<double> dr(n_thetas, 0.0);
+    s = beta_param_cache_radius_and_derivative(
+            shared_cache, params.data(), n_params, radii2.data(), dr.data(), n_thetas);
+    check(s == BETA_PARAM_VALID, "cache_radius_and_derivative VALID");
+    check(radii2 == radii, "cache_radius_and_derivative radii match radius_grid");
 
-    beta_param::Cache lean_cxx{8};
-    check(lean_cxx.n_grid() == 0, "C++: single-arg Cache reports n_grid 0");
+    // Private cache, both flags off — the standalone comparison partner below
+    // (same max_l = n_params, so the normalization tables are bit-identical).
+    std::vector<double> radii_plain(n_thetas, -1.0);
+    s = beta_param_cache_radius_grid(
+            plain_cache, params.data(), n_params, radii_plain.data(), n_thetas);
+    check(s == BETA_PARAM_VALID, "cache_radius_grid on a private cache VALID");
 
-    // Same max as the cache4 result held in `radii` — parity is per-max (see above).
-    beta_param::Cache cxx(4, 181);
-    std::vector<double> radii_cxx(181);
-    std::string message;
-    auto status = cxx.compute_radius_grid(params, radii_cxx, message);
-    check(status == beta_param::Status::Valid, "hpp: compute Valid");
-    identical = true;
-    for (int i = 0; i < 181; ++i) identical = identical && (radii_cxx[i] == radii[i]);
-    check(identical, "hpp: bit-identical to raw C path");
+    std::vector<double> radii_unchecked(n_thetas, -1.0);
+    s = beta_param_cache_radius_grid_unchecked(
+            plain_cache, params.data(), n_params, radii_unchecked.data(), n_thetas);
+    check(s == BETA_PARAM_VALID, "cache_radius_grid_unchecked VALID");
+    check(all_positive(radii_unchecked), "cache_radius_grid_unchecked radii positive");
 
-    std::vector<double> wrong_size(180);
-    status = cxx.compute_radius_grid(params, wrong_size, message);
-    check(status == beta_param::Status::ErrorInvalidBufferSize, "hpp: wrong radii size pre-checked");
+    double corrected_beta10 = -1.0, r_north = -1.0, r_south = -1.0, volume_factor = -1.0;
+    s = beta_param_cache_resolve_shape(shared_cache, params.data(), n_params,
+                                       &corrected_beta10, &r_north, &r_south,
+                                       &volume_factor);
+    check(s == BETA_PARAM_VALID, "cache_resolve_shape VALID");
+    check(r_north > 0.0 && r_south > 0.0, "cache_resolve_shape polar radii positive");
+    check(volume_factor > 0.0, "cache_resolve_shape volume factor positive");
 
-    double corrected = -1.0;
-    std::vector<double> asym{0.30, 0.60, 0.40, 0.10};
-    status = cxx.compute_radius_grid_with_com_shift(asym, radii_cxx, corrected, message);
-    check(status == beta_param::Status::Valid, "hpp: com-shift Valid");
-    check(std::fabs(corrected - 0.30) > 1e-6, "hpp: corrected beta10 moved");
+    const int n_nodes = static_cast<int>(node_thetas.size());
+    std::vector<double> node_radii(static_cast<std::size_t>(n_nodes), -1.0);
+    std::vector<double> node_dr(static_cast<std::size_t>(n_nodes), 0.0);
+    s = beta_param_cache_node_radius_and_derivative(
+            shared_cache, nodes, params.data(), n_params,
+            node_radii.data(), node_dr.data(), n_nodes);
+    check(s == BETA_PARAM_VALID, "cache_node_radius_and_derivative VALID");
+    check(all_positive(node_radii), "node radii positive");
 
-    // --- Node-set API (C) ---
-    {
-        std::array<char, 256> nbuf{};
-        const double thetas[3] = {0.4, 1.5707963267948966, 2.7};
-        beta_param_cache_t* ns_cache =
-                beta_param_cache_create(8, 181, static_cast<int>(nbuf.size()), nbuf.data());
-        check(ns_cache != nullptr, "C: node-set cache create");
+    // --- Buffer-size mismatch is caught by the Fortran layer ---
+    std::vector<double> short_radii(n_thetas - 1, 0.0);
+    s = beta_param_cache_radius_grid(
+            shared_cache, params.data(), n_params, short_radii.data(), n_thetas - 1);
+    check(s == BETA_PARAM_ERROR_INVALID_BUFFER_SIZE,
+          "wrong radii length -> INVALID_BUFFER_SIZE");
 
-        beta_param_node_set_t* nodes = beta_param_node_set_create(
-                ns_cache, thetas, 3, static_cast<int>(nbuf.size()), nbuf.data());
-        check(nodes != nullptr, "C: node_set_create succeeds");
+    // --- Wrong parameter count is caught by the engine ---
+    const std::vector<double> five{0.0, 0.1, 0.1, 0.1, 0.1};
+    s = beta_param_cache_radius_grid(shared_cache, five.data(), 5, radii.data(), n_thetas);
+    check(s == BETA_PARAM_ERROR_WRONG_PARAM_COUNT,
+          "wrong params length -> WRONG_PARAM_COUNT");
 
-        const double ns_params[4] = {0.1, 0.2, 0.05, 0.1};
-        double beta_con[8];
-        double corrected_beta10 = -1.0, r_north = -1.0, r_south = -1.0;
-        int st = beta_param_cache_resolve_shape(
-                ns_cache, ns_params, 4, beta_con, &corrected_beta10, &r_north, &r_south,
-                1, static_cast<int>(nbuf.size()), nbuf.data());
-        check(st == BETA_PARAM_VALID, "C: resolve_shape VALID");
-        check(r_north > 0.0 && r_south > 0.0, "C: resolve_shape pole radii positive");
+    // --- NULL handles into computes ---
+    s = beta_param_cache_radius_grid(nullptr, params.data(), n_params, radii.data(), n_thetas);
+    check(s == BETA_PARAM_ERROR_CACHE_NOT_INITIALIZED,
+          "NULL cache into radius_grid -> CACHE_NOT_INITIALIZED");
+    s = beta_param_cache_node_radius_and_derivative(
+            shared_cache, nullptr, params.data(), n_params,
+            node_radii.data(), node_dr.data(), n_nodes);
+    check(s == BETA_PARAM_ERROR_CACHE_NOT_INITIALIZED,
+          "NULL node set into node compute -> CACHE_NOT_INITIALIZED");
 
-        double corrected_no_com = -1.0;
-        st = beta_param_cache_resolve_shape(
-                ns_cache, ns_params, 4, beta_con, &corrected_no_com, &r_north, &r_south,
-                0, static_cast<int>(nbuf.size()), nbuf.data());
-        check(st == BETA_PARAM_VALID, "C: resolve_shape no-COM VALID");
-        check(corrected_no_com == 0.1, "C: no-COM corrected_beta10 == input beta10");
+    // --- Standalone entry points ---
+    std::vector<double> sa_radii(n_thetas, -1.0);
+    s = beta_param_radius_grid_standalone(params.data(), n_params, thetas.data(),
+                                          n_thetas, 0, 0, sa_radii.data());
+    check(s == BETA_PARAM_VALID, "radius_grid_standalone VALID");
+    check(sa_radii == radii_plain,
+          "standalone matches the same-max_l no-flags cache path bit for bit");
 
-        double ns_radii[3], ns_dr[3];
-        st = beta_param_cache_compute_radius_and_derivative(
-                ns_cache, nodes, beta_con, 8, ns_radii, ns_dr, 3,
-                static_cast<int>(nbuf.size()), nbuf.data());
-        check(st == BETA_PARAM_VALID, "C: radius_and_derivative VALID");
-        for (int i = 0; i < 3; ++i) check(ns_radii[i] > 0.0, "C: node-set radius positive");
+    std::vector<double> sa_radii2(n_thetas, -1.0);
+    std::vector<double> sa_dr(n_thetas, 0.0);
+    s = beta_param_radius_and_derivative_standalone(
+            params.data(), n_params, thetas.data(), n_thetas, 1, 1,
+            sa_radii2.data(), sa_dr.data());
+    check(s == BETA_PARAM_VALID, "radius_and_derivative_standalone (both flags) VALID");
+    check(all_positive(sa_radii2), "standalone radii positive");
 
-        // Pole node must be rejected with the new code (NULL handle, message set)
-        const double pole_theta[1] = {0.0};
-        beta_param_node_set_t* bad = beta_param_node_set_create(
-                ns_cache, pole_theta, 1, static_cast<int>(nbuf.size()), nbuf.data());
-        check(bad == nullptr, "C: pole node rejected with NULL handle");
-        check(nbuf[0] != '\0', "C: pole rejection message non-empty");
+    // --- Status messages are static, non-empty, and code-specific ---
+    const char* msg_north = beta_param_status_message(BETA_PARAM_ERROR_NORTH_POLE);
+    check(msg_north != nullptr && std::string(msg_north).find("north") != std::string::npos,
+          "status_message(100) mentions the north pole");
+    check(msg_north == beta_param_status_message(BETA_PARAM_ERROR_NORTH_POLE),
+          "status_message returns the same static pointer every call");
+    check(std::strcmp(beta_param_status_message(BETA_PARAM_VALID), "valid") == 0,
+          "status_message(0) is 'valid'");
+    check(std::string(beta_param_status_message(-12345)).find("unknown") != std::string::npos,
+          "status_message on an unknown code falls back");
 
-        beta_param_node_set_destroy(nodes);
-        beta_param_node_set_destroy(nullptr);  // null-safe by contract
-        beta_param_cache_destroy(ns_cache);
-    }
-
-    // --- Node-set API (C++ wrapper) ---
-    {
-        beta_param::Cache c8(8, 181);
-        const std::array<double, 3> thetas{0.4, 1.5707963267948966, 2.7};
-        beta_param::NodeSet nodes(c8, thetas);
-        check(nodes.n_nodes() == 3, "hpp: NodeSet n_nodes");
-
-        const std::vector<double> ns_params{0.1, 0.2, 0.05, 0.1};
-        std::vector<double> beta_con(8);
-        double corrected_beta10 = 0.0, r_north = 0.0, r_south = 0.0;
-        std::string msg;
-        auto st = c8.resolve_shape(ns_params, beta_con, corrected_beta10, r_north, r_south, msg);
-        check(st == beta_param::Status::Valid, "hpp: resolve_shape Valid");
-
-        std::vector<double> r(3), dr(3);
-        st = c8.compute_radius_and_derivative(beta_con, nodes, r, dr, msg);
-        check(st == beta_param::Status::Valid, "hpp: radius_and_derivative Valid");
-        check(r[0] > 0.0 && r[1] > 0.0 && r[2] > 0.0, "hpp: node radii positive");
-
-        bool pole_threw = false;
-        try {
-            const std::array<double, 1> pole{0.0};
-            beta_param::NodeSet bad(c8, pole);
-        } catch (const std::runtime_error&) {
-            pole_threw = true;
-        }
-        check(pole_threw, "hpp: NodeSet constructor throws on pole node");
-    }
+    // --- Teardown (destroys are NULL-safe by contract) ---
+    beta_param_node_set_destroy(nodes);
+    beta_param_node_set_destroy(nullptr);
+    beta_param_cache_destroy(shared_cache);
+    beta_param_cache_destroy(plain_cache);
+    beta_param_cache_destroy(nullptr);
+    beta_param_tables_destroy(tables);
+    beta_param_tables_destroy(nullptr);
 
     std::printf("c_api_smoke_test: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

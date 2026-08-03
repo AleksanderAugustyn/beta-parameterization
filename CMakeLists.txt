@@ -43,6 +43,7 @@ create_fortran_library_interface(TARGET beta_parameterization_flags)
 set(BETA_PARAM_SOURCES
         src/beta_parameterization_workers_mod.f08
         src/beta_parameterization_mod.f08
+        src/beta_parameterization_c_api_mod.f08
 )
 
 # --- Static library target ---
@@ -140,5 +141,10 @@ target_link_libraries(golden_capture PRIVATE
         beta_parameterization beta_param_test_utils beta_parameterization_flags)
 set_target_properties(golden_capture PROPERTIES
         Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/capture)
+
+# C API smoke test: links the SHARED library, the binary the bindings load.
+add_executable(c_api_smoke_test tests/c_api_smoke_test.cpp)
+target_link_libraries(c_api_smoke_test PRIVATE beta_parameterization_cxx)
+add_test(NAME c_api_smoke COMMAND c_api_smoke_test)
 
 endif ()
