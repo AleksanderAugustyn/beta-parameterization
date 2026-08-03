@@ -43,6 +43,7 @@
 
 #include "beta_parameterization.h"
 
+#include <algorithm>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -292,11 +293,16 @@ public:
 
     /** R(theta) and dR/dtheta at the primary thetas. Both buffers must hold
      *  exactly n_thetas() doubles; unequal span sizes are rejected here with
-     *  Status::invalid_buffer_size rather than silently truncated. */
+     *  Status::invalid_buffer_size rather than silently truncated, and both
+     *  output spans are zero-filled as on any other rejection. */
     [[nodiscard]] Status radius_and_derivative(const std::span<const double> params,
                                                const std::span<double> radii,
                                                const std::span<double> dr_dthetas) {
-        if (radii.size() != dr_dthetas.size()) return Status::invalid_buffer_size;
+        if (radii.size() != dr_dthetas.size()) {
+            std::ranges::fill(radii, 0.0);
+            std::ranges::fill(dr_dthetas, 0.0);
+            return Status::invalid_buffer_size;
+        }
         return static_cast<Status>(beta_param_cache_radius_and_derivative(
                 handle_, params.data(), detail::as_int(params.size()),
                 radii.data(), dr_dthetas.data(), detail::as_int(radii.size())));
@@ -339,11 +345,16 @@ public:
     /** R(theta) and dR/dtheta at a node set's thetas. The node set's tables
      *  must have max_l >= n_params(), else Status::node_set_mismatch. Both
      *  buffers must hold exactly node_set.n_nodes() doubles; unequal span sizes
-     *  are rejected here with Status::invalid_buffer_size. */
+     *  are rejected here with Status::invalid_buffer_size, both output spans
+     *  zero-filled as on any other rejection. */
     [[nodiscard]] Status node_radius_and_derivative(
             const NodeSet& node_set, const std::span<const double> params,
             const std::span<double> radii, const std::span<double> dr_dthetas) {
-        if (radii.size() != dr_dthetas.size()) return Status::invalid_buffer_size;
+        if (radii.size() != dr_dthetas.size()) {
+            std::ranges::fill(radii, 0.0);
+            std::ranges::fill(dr_dthetas, 0.0);
+            return Status::invalid_buffer_size;
+        }
         return static_cast<Status>(beta_param_cache_node_radius_and_derivative(
                 handle_, node_set.native_handle(),
                 params.data(), detail::as_int(params.size()),
@@ -359,12 +370,16 @@ private:
 /* --- Standalone computes: build, use and discard their own tables. --- */
 
 /** One-off R(theta); `radii` holds exactly thetas.size() doubles. n_params may
- *  go up to max_params_limit. */
+ *  go up to max_params_limit. A size mismatch is rejected here with
+ *  Status::invalid_buffer_size and `radii` zero-filled. */
 [[nodiscard]] inline Status radius_grid_standalone(
         const std::span<const double> params, const std::span<const double> thetas,
         const bool conserve_volume, const bool apply_com,
         const std::span<double> radii) {
-    if (radii.size() != thetas.size()) return Status::invalid_buffer_size;
+    if (radii.size() != thetas.size()) {
+        std::ranges::fill(radii, 0.0);
+        return Status::invalid_buffer_size;
+    }
     return static_cast<Status>(beta_param_radius_grid_standalone(
             params.data(), detail::as_int(params.size()),
             thetas.data(), detail::as_int(thetas.size()),
@@ -372,12 +387,15 @@ private:
 }
 
 /** One-off R(theta) and dR/dtheta; both buffers hold exactly thetas.size()
- *  doubles. */
+ *  doubles. A size mismatch is rejected here with Status::invalid_buffer_size
+ *  and both output spans zero-filled. */
 [[nodiscard]] inline Status radius_and_derivative_standalone(
         const std::span<const double> params, const std::span<const double> thetas,
         const bool conserve_volume, const bool apply_com,
         const std::span<double> radii, const std::span<double> dr_dthetas) {
     if (radii.size() != thetas.size() || dr_dthetas.size() != thetas.size()) {
+        std::ranges::fill(radii, 0.0);
+        std::ranges::fill(dr_dthetas, 0.0);
         return Status::invalid_buffer_size;
     }
     return static_cast<Status>(beta_param_radius_and_derivative_standalone(
