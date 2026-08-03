@@ -1,88 +1,113 @@
-!> Prints golden values for the four regression shapes as paste-ready Fortran.
-!! Run AFTER all Task-3 fixes; output goes into beta_param_golden_test.f08.
+!> Capture tool for the 3.0.0 golden baseline.
+!!
+!! Prints paste-ready `assert_close` lines for six representative shapes in the
+!! two extreme regimes — (conserve_volume, apply_com) = (F,F) and (T,T). The
+!! output goes verbatim into `beta_param_golden_test.f08`, which recomputes the
+!! same quantities through the same public calls and compares.
+!!
+!! Not a test: no add_test, it only writes to stdout. It stops hard if any
+!! captured run reports a status other than SHAPE_VALID — a golden may only be
+!! taken from a shape the library accepts.
 program golden_capture
 
     use precision_utilities_mod, only: ik, rk
     use mathematical_and_physical_constants_mod, only: PI_C
-    use beta_parameterization_mod, only: cache_t, node_set_t, LEGENDRE_VALID
-    use test_utils_mod, only: assert_int_eq, test_summary
+    use beta_parameterization_mod, only: cache_t, cache_init_s, cache_free_s, &
+            cache_resolve_shape_s, cache_radius_grid_s, SHAPE_VALID
 
     implicit none
 
-    integer(kind = ik), parameter :: IDX(7) = [1_ik, 31_ik, 61_ik, 91_ik, 121_ik, 151_ik, 181_ik]
-    type(cache_t)        :: cache
-    integer(kind = ik)   :: code
-    character(len = 256) :: message
+    integer(kind = ik), parameter :: N_THETAS = 16_ik
 
-    call cache%init(8_ik, 181_ik, code, message)
-    call assert_int_eq(code, LEGENDRE_VALID, 'capture: cache init')
+    real(kind = rk) :: thetas(N_THETAS)
+    integer(kind = ik) :: i
 
-    call capture('G1', [0.0_rk, 0.215_rk, 0.0_rk, 0.095_rk], .false.)
-    call capture('G2', [0.0_rk, 0.85_rk, 0.35_rk, 0.18_rk, 0.05_rk, 0.02_rk], .true.)
-    call capture('G3', [0.0_rk, -0.35_rk, 0.0_rk, 0.05_rk], .false.)
-    call capture('G4', [0.0_rk, 0.40_rk, 0.20_rk, 0.10_rk, 0.05_rk, 0.02_rk, 0.01_rk, 0.005_rk], .true.)
-    call test_summary()
+    ! Open uniform grid: no node sits on a pole, so the poles stay the job of
+    ! resolve and never leak into the grid goldens.
+    do i = 1_ik, N_THETAS
+        thetas(i) = real(i, rk) * PI_C / real(N_THETAS + 1_ik, rk)
+    end do
+
+    call capture_shape_s(1_ik, [0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk])
+    call capture_shape_s(2_ik, [0.0_rk, 0.3_rk, 0.0_rk, 0.0_rk])
+    call capture_shape_s(3_ik, [0.05_rk, 0.25_rk, 0.12_rk, 0.03_rk])
+    call capture_shape_s(4_ik, [0.02_rk, 0.15_rk, 0.08_rk, -0.05_rk, 0.03_rk, 0.01_rk])
+    call capture_shape_s(5_ik, [0.02_rk, 0.2_rk, 0.1_rk, -0.04_rk, 0.03_rk, -0.02_rk, &
+            0.01_rk, 0.005_rk])
+    call capture_shape_s(6_ik, [0.0_rk, 0.35_rk, 0.25_rk, 0.1_rk])
 
 contains
 
-    subroutine capture(name, params, with_shift)
-        character(len = *), intent(in) :: name
+    !> Both regimes for one shape.
+    subroutine capture_shape_s(id, params)
+        integer(kind = ik), intent(in) :: id
         real(kind = rk),    intent(in) :: params(:)
-        logical,            intent(in) :: with_shift
-        real(kind = rk)      :: radii(181), corrected
-        integer(kind = ik)   :: c, i
-        character(len = 256) :: msg
 
-        if (with_shift) then
-            call cache%compute_radius_grid_with_com_shift(params, radii, corrected, c, msg)
-        else
-            call cache%compute_radius_grid(params, radii, c, msg)
-            corrected = 0.0_rk
-        end if
-        call assert_int_eq(c, LEGENDRE_VALID, name // ': valid')
+        call capture_regime_s(id, params, .false., .false., 'FF')
+        call capture_regime_s(id, params, .true., .true., 'TT')
+    end subroutine capture_shape_s
 
-        write(*, '(A,A,A)') 'real(kind = rk), parameter :: ', name, '_EXPECTED(7) = [ &'
-        do i = 1_ik, 6_ik
-            write(*, '(A,ES24.16E3,A)') '        ', radii(IDX(i)), '_rk, &'
-        end do
-        write(*, '(A,ES24.16E3,A)') '        ', radii(IDX(7)), '_rk]'
-        if (with_shift) then
-            write(*, '(A,A,A,ES24.16E3,A)') 'real(kind = rk), parameter :: ', name, &
-                    '_CORRECTED_B10 = ', corrected, '_rk'
-        end if
-
-        call capture_node_set(name, params)
-    end subroutine capture
-
-    !> Node-set goldens: resolve + evaluate R and dR/dtheta at three fixed thetas.
-    !! Layout: [corrected_beta10, r_north, r_south, R(1:3), dR(1:3)].
-    subroutine capture_node_set(name, params)
-        character(len = *), intent(in) :: name
+    !> One (shape, regime) block: init, resolve, radius grid, then four literals.
+    subroutine capture_regime_s(id, params, conserve_volume, apply_com, tag)
+        integer(kind = ik), intent(in) :: id
         real(kind = rk),    intent(in) :: params(:)
-        type(node_set_t)     :: node_set
-        real(kind = rk)      :: thetas(3), beta_con(8), radii(3), dr(3)
-        real(kind = rk)      :: corrected_beta10, r_north, r_south, values(9)
-        integer(kind = ik)   :: c, i
-        character(len = 256) :: msg
+        logical,            intent(in) :: conserve_volume, apply_com
+        character(len = *), intent(in) :: tag
 
-        thetas = [PI_C / 8.0_rk, PI_C / 2.0_rk, 7.0_rk * PI_C / 8.0_rk]
-        call cache%build_node_set(thetas, node_set, c, msg)
-        call assert_int_eq(c, LEGENDRE_VALID, name // ': node set built')
-        call cache%resolve_shape(params, beta_con, corrected_beta10, r_north, r_south, c, msg)
-        call assert_int_eq(c, LEGENDRE_VALID, name // ': resolved')
-        call cache%compute_radius_and_derivative(beta_con, node_set, radii, dr, c, msg)
-        call assert_int_eq(c, LEGENDRE_VALID, name // ': evaluated')
+        type(cache_t)      :: cache
+        real(kind = rk)    :: radii(N_THETAS)
+        real(kind = rk)    :: corrected_beta10, r_north, r_south, volume_factor
+        integer(kind = ik) :: status
+        character(len = 16) :: prefix
 
-        values(1)   = corrected_beta10
-        values(2)   = r_north
-        values(3)   = r_south
-        values(4:6) = radii
-        values(7:9) = dr
-        write(*, '(A,A,A)') 'real(kind = rk), parameter :: ', name, '_NODE_SET_EXPECTED(9) = [ &'
-        do i = 1_ik, 8_ik
-            write(*, '(A,ES24.16E3,A)') '        ', values(i), '_rk, &'
-        end do
-        write(*, '(A,ES24.16E3,A)') '        ', values(9), '_rk]'
-    end subroutine capture_node_set
+        write(prefix, '(A,I0,A,A)') 'S', id, ' ', tag
+
+        call cache_init_s(cache, size(params, kind = ik), thetas, conserve_volume, &
+                apply_com, status)
+        call require_valid_s(prefix, 'init', status)
+
+        call cache_resolve_shape_s(cache, params, corrected_beta10, r_north, r_south, &
+                volume_factor, status)
+        call require_valid_s(prefix, 'resolve', status)
+
+        call cache_radius_grid_s(cache, params, radii, status)
+        call require_valid_s(prefix, 'radius grid', status)
+
+        write(*, '(A,A,A,I0,A,L1,A,L1,A)') '    ! ', trim(prefix), ': n_params = ', &
+                size(params, kind = ik), ', conserve_volume = ', conserve_volume, &
+                ', apply_com = ', apply_com, ', status = 0'
+        call emit_s('radii(1)',         radii(1),         trim(prefix))
+        call emit_s('radii(16)',        radii(N_THETAS),  trim(prefix))
+        call emit_s('corrected_beta10', corrected_beta10, trim(prefix))
+        call emit_s('volume_factor',    volume_factor,    trim(prefix))
+
+        call cache_free_s(cache)
+    end subroutine capture_regime_s
+
+    !> One paste-ready assertion, value at full double round-trip precision.
+    subroutine emit_s(expr, value, prefix)
+        character(len = *), intent(in) :: expr
+        real(kind = rk),    intent(in) :: value
+        character(len = *), intent(in) :: prefix
+
+        character(len = 32) :: buffer
+
+        write(buffer, '(ES25.17)') value
+        write(*, '(A)') '    call assert_close(' // expr // ', ' // &
+                trim(adjustl(buffer)) // '_rk, 1.0e-15_rk, ''' // &
+                prefix // ' ' // expr // ''')'
+    end subroutine emit_s
+
+    !> A golden is only valid if the library accepted the shape.
+    subroutine require_valid_s(prefix, stage, status)
+        character(len = *), intent(in) :: prefix, stage
+        integer(kind = ik), intent(in) :: status
+
+        if (status /= SHAPE_VALID) then
+            write(*, '(A,A,A,A,A,I0)') '    ! CAPTURE ABORTED: ', prefix, ' ', stage, &
+                    ' returned status ', status
+            error stop 1
+        end if
+    end subroutine require_valid_s
 
 end program golden_capture

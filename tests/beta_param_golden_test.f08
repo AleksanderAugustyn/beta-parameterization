@@ -1,165 +1,152 @@
-!> Locked regression goldens for four representative shapes.
-!! Values captured by tests/golden_capture.f08 at commit 8bfe973 (post Task-3 fixes).
+!> Golden baseline for the 3.0.0 pipeline (Newton COM, in-library volume).
+!!
+!! Six representative shapes x the two extreme regimes
+!! (conserve_volume, apply_com) = (F,F) and (T,T). The literals were captured
+!! from this library by `golden_capture` and pin cross-version drift: any
+!! change to the resolve/volume/render path that moves a number by more than
+!! 1e-15 relative shows up here.
+!!
+!! Bit-level identity between call paths is the bitwise suite's job; this suite
+!! answers "does the library still produce the same physics as the baseline".
+!! Regenerate with `./build/golden_capture` — and only with a reason.
 program beta_param_golden_test
 
     use precision_utilities_mod, only: ik, rk
     use mathematical_and_physical_constants_mod, only: PI_C
-    use beta_parameterization_mod, only: cache_t, node_set_t, LEGENDRE_VALID
     use test_utils_mod, only: assert_int_eq, assert_close, test_summary
+    use beta_parameterization_mod, only: cache_t, cache_init_s, cache_free_s, &
+            cache_resolve_shape_s, cache_radius_grid_s, SHAPE_VALID
 
     implicit none
 
-    integer(kind = ik), parameter :: IDX(7) = [1_ik, 31_ik, 61_ik, 91_ik, 121_ik, 151_ik, 181_ik]
-    real(kind = rk),    parameter :: TOL = 1.0e-15_rk
+    integer(kind = ik), parameter :: N_THETAS = 16_ik
 
-    real(kind = rk), parameter :: G1_EXPECTED(7) = [ &
-             1.2160153887141389E+000_rk, &
-             1.0866457882160419E+000_rk, &
-             9.5980794102974309E-001_rk, &
-             9.6233969434154143E-001_rk, &
-             9.5980794102974309E-001_rk, &
-             1.0866457882160419E+000_rk, &
-             1.2160153887141389E+000_rk]
-    real(kind = rk), parameter :: G2_EXPECTED(7) = [ &
-             1.9145931553115427E+000_rk, &
-             1.3169048809475408E+000_rk, &
-             7.3431444834952730E-001_rk, &
-             7.8268444464280551E-001_rk, &
-             1.0567285473303596E+000_rk, &
-             1.3452258418380265E+000_rk, &
-             1.5030848311140956E+000_rk]
-    real(kind = rk), parameter :: G2_CORRECTED_B10 = -2.0926908316026530E-001_rk
-    real(kind = rk), parameter :: G3_EXPECTED(7) = [ &
-             8.2154012308931779E-001_rk, &
-             8.6300792970435258E-001_rk, &
-             1.0153653080975249E+000_rk, &
-             1.1262548798756626E+000_rk, &
-             1.0153653080975251E+000_rk, &
-             8.6300792970435258E-001_rk, &
-             8.2154012308931779E-001_rk]
-    real(kind = rk), parameter :: G4_EXPECTED(7) = [ &
-             1.5346514262194999E+000_rk, &
-             1.1529734346542979E+000_rk, &
-             8.7376808780044701E-001_rk, &
-             9.0081230258281431E-001_rk, &
-             1.0265221633106583E+000_rk, &
-             1.1472278889699292E+000_rk, &
-             1.1915473089293442E+000_rk]
-    real(kind = rk), parameter :: G4_CORRECTED_B10 = -7.2500830051600282E-002_rk
+    real(kind = rk)    :: thetas(N_THETAS)
+    real(kind = rk)    :: radii(N_THETAS)
+    real(kind = rk)    :: corrected_beta10, volume_factor
+    integer(kind = ik) :: i
 
-    ! Node-set goldens (captured by golden_capture, v2.2.0 node-set API):
-    ! layout [corrected_beta10, r_north, r_south, R(1:3), dR(1:3)] at
-    ! thetas = [pi/8, pi/2, 7pi/8].
-    real(kind = rk), parameter :: G1_NODE_SET_EXPECTED(9) = [ &
-             0.0000000000000000E+000_rk, &
-             1.2160153887141389E+000_rk, &
-             1.2160153887141389E+000_rk, &
-             1.1348983254477432E+000_rk, &
-             9.6233969434154143E-001_rk, &
-             1.1348983254477432E+000_rk, &
-            -3.5524427545959703E-001_rk, &
-             1.2009039485575869E-017_rk, &
-             3.5524427545959714E-001_rk]
-    real(kind = rk), parameter :: G2_NODE_SET_EXPECTED(9) = [ &
-            -2.0926908316026530E-001_rk, &
-             1.9145931553115429E+000_rk, &
-             1.5030848311140959E+000_rk, &
-             1.5366433412487048E+000_rk, &
-             7.8268444464280551E-001_rk, &
-             1.4071871239950646E+000_rk, &
-            -1.6309751173882105E+000_rk, &
-             4.0637180707528003E-001_rk, &
-             4.3722024621518629E-001_rk]
-    real(kind = rk), parameter :: G3_NODE_SET_EXPECTED(9) = [ &
-             0.0000000000000000E+000_rk, &
-             8.2154012308931779E-001_rk, &
-             8.2154012308931779E-001_rk, &
-             8.4302397766917225E-001_rk, &
-             1.1262548798756626E+000_rk, &
-             8.4302397766917225E-001_rk, &
-             1.2290351730043024E-001_rk, &
-             5.9988033154643641E-017_rk, &
-            -1.2290351730043028E-001_rk]
-    real(kind = rk), parameter :: G4_NODE_SET_EXPECTED(9) = [ &
-            -7.2500830051600282E-002_rk, &
-             1.5346514262195001E+000_rk, &
-             1.1915473089293445E+000_rk, &
-             1.2820856414035799E+000_rk, &
-             9.0081230258281431E-001_rk, &
-             1.1656292020106376E+000_rk, &
-            -1.0077766770385752E+000_rk, &
-             1.9551664231146185E-001_rk, &
-             1.2297403623871962E-001_rk]
+    ! Same open uniform grid the capture used: no node on a pole.
+    do i = 1_ik, N_THETAS
+        thetas(i) = real(i, rk) * PI_C / real(N_THETAS + 1_ik, rk)
+    end do
 
-    type(cache_t)        :: cache
-    integer(kind = ik)   :: code
-    character(len = 256) :: message
+    ! S1: sphere
+    call run_case_s([0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk], .false., .false., 'S1 FF', &
+            radii, corrected_beta10, volume_factor)
+    call assert_close(radii(1), 1.00000000000000000E+00_rk, 1.0e-15_rk, 'S1 FF radii(1)')
+    call assert_close(radii(16), 1.00000000000000000E+00_rk, 1.0e-15_rk, 'S1 FF radii(16)')
+    call assert_close(corrected_beta10, 0.00000000000000000E+00_rk, 1.0e-15_rk, 'S1 FF corrected_beta10')
+    call assert_close(volume_factor, 1.00000000000000000E+00_rk, 1.0e-15_rk, 'S1 FF volume_factor')
+    call run_case_s([0.0_rk, 0.0_rk, 0.0_rk, 0.0_rk], .true., .true., 'S1 TT', &
+            radii, corrected_beta10, volume_factor)
+    call assert_close(radii(1), 1.00000000000002487E+00_rk, 1.0e-15_rk, 'S1 TT radii(1)')
+    call assert_close(radii(16), 1.00000000000002487E+00_rk, 1.0e-15_rk, 'S1 TT radii(16)')
+    call assert_close(corrected_beta10, 0.00000000000000000E+00_rk, 1.0e-15_rk, 'S1 TT corrected_beta10')
+    call assert_close(volume_factor, 1.00000000000002487E+00_rk, 1.0e-15_rk, 'S1 TT volume_factor')
 
-    call cache%init(8_ik, 181_ik, code, message)
-    call assert_int_eq(code, LEGENDRE_VALID, 'golden: cache init')
+    ! S2: prolate
+    call run_case_s([0.0_rk, 0.3_rk, 0.0_rk, 0.0_rk], .false., .false., 'S2 FF', &
+            radii, corrected_beta10, volume_factor)
+    call assert_close(radii(1), 1.17965097898173399E+00_rk, 1.0e-15_rk, 'S2 FF radii(1)')
+    call assert_close(radii(16), 1.17965097898173399E+00_rk, 1.0e-15_rk, 'S2 FF radii(16)')
+    call assert_close(corrected_beta10, 0.00000000000000000E+00_rk, 1.0e-15_rk, 'S2 FF corrected_beta10')
+    call assert_close(volume_factor, 1.00000000000000000E+00_rk, 1.0e-15_rk, 'S2 FF volume_factor')
+    call run_case_s([0.0_rk, 0.3_rk, 0.0_rk, 0.0_rk], .true., .true., 'S2 TT', &
+            radii, corrected_beta10, volume_factor)
+    call assert_close(radii(1), 1.17117341036512990E+00_rk, 1.0e-15_rk, 'S2 TT radii(1)')
+    call assert_close(radii(16), 1.17117341036512990E+00_rk, 1.0e-15_rk, 'S2 TT radii(16)')
+    call assert_close(corrected_beta10, 0.00000000000000000E+00_rk, 1.0e-15_rk, 'S2 TT corrected_beta10')
+    call assert_close(volume_factor, 9.92813494187982815E-01_rk, 1.0e-15_rk, 'S2 TT volume_factor')
 
-    call check('G1', [0.0_rk, 0.215_rk, 0.0_rk, 0.095_rk], .false., G1_EXPECTED, 0.0_rk)
-    call check('G2', [0.0_rk, 0.85_rk, 0.35_rk, 0.18_rk, 0.05_rk, 0.02_rk], .true., &
-            G2_EXPECTED, G2_CORRECTED_B10)
-    call check('G3', [0.0_rk, -0.35_rk, 0.0_rk, 0.05_rk], .false., G3_EXPECTED, 0.0_rk)
-    call check('G4', [0.0_rk, 0.40_rk, 0.20_rk, 0.10_rk, 0.05_rk, 0.02_rk, 0.01_rk, 0.005_rk], &
-            .true., G4_EXPECTED, G4_CORRECTED_B10)
+    ! S3: asymmetric
+    call run_case_s([0.05_rk, 0.25_rk, 0.12_rk, 0.03_rk], .false., .false., 'S3 FF', &
+            radii, corrected_beta10, volume_factor)
+    call assert_close(radii(1), 1.27555852826677296E+00_rk, 1.0e-15_rk, 'S3 FF radii(1)')
+    call assert_close(radii(16), 1.06631792857040297E+00_rk, 1.0e-15_rk, 'S3 FF radii(16)')
+    call assert_close(corrected_beta10, 5.00000000000000028E-02_rk, 1.0e-15_rk, 'S3 FF corrected_beta10')
+    call assert_close(volume_factor, 1.00000000000000000E+00_rk, 1.0e-15_rk, 'S3 FF volume_factor')
+    call run_case_s([0.05_rk, 0.25_rk, 0.12_rk, 0.03_rk], .true., .true., 'S3 TT', &
+            radii, corrected_beta10, volume_factor)
+    call assert_close(radii(1), 1.23265776951246386E+00_rk, 1.0e-15_rk, 'S3 TT radii(1)')
+    call assert_close(radii(16), 1.09448160290258545E+00_rk, 1.0e-15_rk, 'S3 TT radii(16)')
+    call assert_close(corrected_beta10, -2.30708623724193915E-02_rk, 1.0e-15_rk, 'S3 TT corrected_beta10')
+    call assert_close(volume_factor, 9.93707146942315656E-01_rk, 1.0e-15_rk, 'S3 TT volume_factor')
 
-    call check_node_set('G1', [0.0_rk, 0.215_rk, 0.0_rk, 0.095_rk], G1_NODE_SET_EXPECTED)
-    call check_node_set('G2', [0.0_rk, 0.85_rk, 0.35_rk, 0.18_rk, 0.05_rk, 0.02_rk], &
-            G2_NODE_SET_EXPECTED)
-    call check_node_set('G3', [0.0_rk, -0.35_rk, 0.0_rk, 0.05_rk], G3_NODE_SET_EXPECTED)
-    call check_node_set('G4', [0.0_rk, 0.40_rk, 0.20_rk, 0.10_rk, 0.05_rk, 0.02_rk, 0.01_rk, 0.005_rk], &
-            G4_NODE_SET_EXPECTED)
+    ! S4: six-parameter mixed
+    call run_case_s([0.02_rk, 0.15_rk, 0.08_rk, -0.05_rk, 0.03_rk, 0.01_rk], .false., .false., 'S4 FF', &
+            radii, corrected_beta10, volume_factor)
+    call assert_close(radii(1), 1.14593727573622317E+00_rk, 1.0e-15_rk, 'S4 FF radii(1)')
+    call assert_close(radii(16), 9.76617097509943410E-01_rk, 1.0e-15_rk, 'S4 FF radii(16)')
+    call assert_close(corrected_beta10, 2.00000000000000004E-02_rk, 1.0e-15_rk, 'S4 FF corrected_beta10')
+    call assert_close(volume_factor, 1.00000000000000000E+00_rk, 1.0e-15_rk, 'S4 FF volume_factor')
+    call run_case_s([0.02_rk, 0.15_rk, 0.08_rk, -0.05_rk, 0.03_rk, 0.01_rk], .true., .true., 'S4 TT', &
+            radii, corrected_beta10, volume_factor)
+    call assert_close(radii(1), 1.13105543631066063E+00_rk, 1.0e-15_rk, 'S4 TT radii(1)')
+    call assert_close(radii(16), 9.86012148345387418E-01_rk, 1.0e-15_rk, 'S4 TT radii(16)')
+    call assert_close(corrected_beta10, -4.88218027607693547E-03_rk, 1.0e-15_rk, 'S4 TT corrected_beta10')
+    call assert_close(volume_factor, 9.97415006814771465E-01_rk, 1.0e-15_rk, 'S4 TT volume_factor')
+
+    ! S5: eight-parameter mixed
+    call run_case_s([0.02_rk, 0.2_rk, 0.1_rk, -0.04_rk, 0.03_rk, -0.02_rk, &
+            0.01_rk, 0.005_rk], .false., .false., 'S5 FF', &
+            radii, corrected_beta10, volume_factor)
+    call assert_close(radii(1), 1.18492682251660542E+00_rk, 1.0e-15_rk, 'S5 FF radii(1)')
+    call assert_close(radii(16), 9.76162497710678645E-01_rk, 1.0e-15_rk, 'S5 FF radii(16)')
+    call assert_close(corrected_beta10, 2.00000000000000004E-02_rk, 1.0e-15_rk, 'S5 FF corrected_beta10')
+    call assert_close(volume_factor, 1.00000000000000000E+00_rk, 1.0e-15_rk, 'S5 FF volume_factor')
+    call run_case_s([0.02_rk, 0.2_rk, 0.1_rk, -0.04_rk, 0.03_rk, -0.02_rk, &
+            0.01_rk, 0.005_rk], .true., .true., 'S5 TT', &
+            radii, corrected_beta10, volume_factor)
+    call assert_close(radii(1), 1.16565815802888451E+00_rk, 1.0e-15_rk, 'S5 TT radii(1)')
+    call assert_close(radii(16), 9.86262088836088791E-01_rk, 1.0e-15_rk, 'S5 TT radii(16)')
+    call assert_close(corrected_beta10, -9.77813399136218467E-03_rk, 1.0e-15_rk, 'S5 TT corrected_beta10')
+    call assert_close(volume_factor, 9.95757198336741589E-01_rk, 1.0e-15_rk, 'S5 TT volume_factor')
+
+    ! S6: strongly deformed, near the validity edge
+    call run_case_s([0.0_rk, 0.35_rk, 0.25_rk, 0.1_rk], .false., .false., 'S6 FF', &
+            radii, corrected_beta10, volume_factor)
+    call assert_close(radii(1), 1.44828587213220206E+00_rk, 1.0e-15_rk, 'S6 FF radii(1)')
+    call assert_close(radii(16), 1.11242694060612979E+00_rk, 1.0e-15_rk, 'S6 FF radii(16)')
+    call assert_close(corrected_beta10, 0.00000000000000000E+00_rk, 1.0e-15_rk, 'S6 FF corrected_beta10')
+    call assert_close(volume_factor, 1.00000000000000000E+00_rk, 1.0e-15_rk, 'S6 FF volume_factor')
+    call run_case_s([0.0_rk, 0.35_rk, 0.25_rk, 0.1_rk], .true., .true., 'S6 TT', &
+            radii, corrected_beta10, volume_factor)
+    call assert_close(radii(1), 1.38953768578917458E+00_rk, 1.0e-15_rk, 'S6 TT radii(1)')
+    call assert_close(radii(16), 1.13018457995286492E+00_rk, 1.0e-15_rk, 'S6 TT radii(16)')
+    call assert_close(corrected_beta10, -7.52542571777818359E-02_rk, 1.0e-15_rk, 'S6 TT corrected_beta10')
+    call assert_close(volume_factor, 9.83992524740617602E-01_rk, 1.0e-15_rk, 'S6 TT volume_factor')
+
     call test_summary()
 
 contains
 
-    subroutine check(name, params, with_shift, expected, expected_b10)
-        character(len = *), intent(in) :: name
-        real(kind = rk),    intent(in) :: params(:), expected(7), expected_b10
-        logical,            intent(in) :: with_shift
-        real(kind = rk)      :: radii(181), corrected
-        integer(kind = ik)   :: c, i
-        character(len = 256) :: msg
+    !> One (shape, regime) case, through exactly the calls the capture used:
+    !! init, resolve, radius grid — same order, same arguments.
+    subroutine run_case_s(params, conserve_volume, apply_com, label, &
+            out_radii, out_corrected_beta10, out_volume_factor)
+        real(kind = rk),    intent(in)  :: params(:)
+        logical,            intent(in)  :: conserve_volume, apply_com
+        character(len = *), intent(in)  :: label
+        real(kind = rk),    intent(out) :: out_radii(:)
+        real(kind = rk),    intent(out) :: out_corrected_beta10, out_volume_factor
 
-        if (with_shift) then
-            call cache%compute_radius_grid_with_com_shift(params, radii, corrected, c, msg)
-        else
-            call cache%compute_radius_grid(params, radii, c, msg)
-        end if
-        call assert_int_eq(c, LEGENDRE_VALID, name // ': valid')
-        do i = 1_ik, 7_ik
-            call assert_close(radii(IDX(i)), expected(i), TOL, name // ': golden radius')
-        end do
-        if (with_shift) call assert_close(corrected, expected_b10, TOL, name // ': golden corrected beta10')
-    end subroutine check
+        type(cache_t)      :: cache
+        real(kind = rk)    :: r_north, r_south
+        integer(kind = ik) :: status
 
-    !> Locked node-set goldens: resolve + evaluate at thetas = [pi/8, pi/2, 7pi/8].
-    subroutine check_node_set(name, params, expected)
-        character(len = *), intent(in) :: name
-        real(kind = rk),    intent(in) :: params(:), expected(9)
-        type(node_set_t)     :: node_set
-        real(kind = rk)      :: thetas(3), beta_con(8), radii(3), dr(3)
-        real(kind = rk)      :: corrected_beta10, r_north, r_south
-        integer(kind = ik)   :: c, i
-        character(len = 256) :: msg
+        call cache_init_s(cache, size(params, kind = ik), thetas, conserve_volume, &
+                apply_com, status)
+        call assert_int_eq(status, SHAPE_VALID, label // ' init')
 
-        thetas = [PI_C / 8.0_rk, PI_C / 2.0_rk, 7.0_rk * PI_C / 8.0_rk]
-        call cache%build_node_set(thetas, node_set, c, msg)
-        call assert_int_eq(c, LEGENDRE_VALID, name // ': node set built')
-        call cache%resolve_shape(params, beta_con, corrected_beta10, r_north, r_south, c, msg)
-        call assert_int_eq(c, LEGENDRE_VALID, name // ': resolved')
-        call cache%compute_radius_and_derivative(beta_con, node_set, radii, dr, c, msg)
-        call assert_int_eq(c, LEGENDRE_VALID, name // ': evaluated')
+        call cache_resolve_shape_s(cache, params, out_corrected_beta10, r_north, &
+                r_south, out_volume_factor, status)
+        call assert_int_eq(status, SHAPE_VALID, label // ' resolve')
 
-        call assert_close(corrected_beta10, expected(1), TOL, name // ': golden node-set corrected beta10')
-        call assert_close(r_north, expected(2), TOL, name // ': golden r_north')
-        call assert_close(r_south, expected(3), TOL, name // ': golden r_south')
-        do i = 1_ik, 3_ik
-            call assert_close(radii(i), expected(3 + i), TOL, name // ': golden node-set R')
-            call assert_close(dr(i), expected(6 + i), TOL, name // ': golden node-set dR/dtheta')
-        end do
-    end subroutine check_node_set
+        call cache_radius_grid_s(cache, params, out_radii, status)
+        call assert_int_eq(status, SHAPE_VALID, label // ' radius grid')
+
+        call cache_free_s(cache)
+    end subroutine run_case_s
 
 end program beta_param_golden_test

@@ -118,7 +118,7 @@ target_include_directories(beta_param_test_utils PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests>)
 
 set(BETA_PARAM_TEST_SUITES status lifecycle resolve outputs standalone bitwise minimality
-        interleave boundary property)
+        interleave boundary property golden)
 foreach (suite IN LISTS BETA_PARAM_TEST_SUITES)
     add_executable(beta_param_${suite}_test tests/beta_param_${suite}_test.f08)
     target_link_libraries(beta_param_${suite}_test PRIVATE
@@ -127,5 +127,18 @@ foreach (suite IN LISTS BETA_PARAM_TEST_SUITES)
             Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/${suite})
     add_test(NAME ${suite} COMMAND beta_param_${suite}_test)
 endforeach ()
+
+# Golden literals carry 17 significant digits (exact double round-trip);
+# gfortran's conversion-extra warning flags the 17th digit as non-significant.
+# Source-file property so it lands after the flags-interface options (last wins).
+set_source_files_properties(tests/beta_param_golden_test.f08 PROPERTIES
+        COMPILE_OPTIONS "-Wno-conversion-extra;-Wno-error=conversion-extra")
+
+# Capture tool for the golden baseline: an executable, never a test.
+add_executable(golden_capture tests/golden_capture.f08)
+target_link_libraries(golden_capture PRIVATE
+        beta_parameterization beta_param_test_utils beta_parameterization_flags)
+set_target_properties(golden_capture PROPERTIES
+        Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/capture)
 
 endif ()
