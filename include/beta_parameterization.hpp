@@ -298,7 +298,10 @@ public:
     }
 
     /** R(theta) with no validation gates and no volume scaling — the
-     *  rendering/diagnostic path. Reports usage errors only. */
+     *  rendering/diagnostic path. Reports usage errors only.
+     *  CAUTION: on a conserve_volume Cache these radii are still UNSCALED, so
+     *  mixing this call with radius_grid() draws two outlines of different size
+     *  for one shape. Scale by resolve_shape()'s volume_factor to match. */
     [[nodiscard]] Status radius_grid_unchecked(const std::span<const double> params,
                                                const std::span<double> radii) {
         return static_cast<Status>(beta_param_cache_radius_grid_unchecked(

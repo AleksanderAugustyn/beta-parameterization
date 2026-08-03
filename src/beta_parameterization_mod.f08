@@ -3,15 +3,89 @@
 !! Three levels, from shared to per-shape:
 !!
 !!   - `tables_t`   — shared immutable level: everything determined by `max_l`
-!!                    and the primary theta set. Built once, shared read-only.
+!!                    and the primary theta set (normalization constants,
+!!                    Gauss-Legendre quadrature, Legendre tables at the primary
+!!                    thetas). Built once, shared read-only.
 !!   - `node_set_t` — caller-owned extra theta nodes with their own Legendre
-!!                    tables, sized to one `tables_t`.
+!!                    tables, sized to one `tables_t`. Immutable after build.
 !!   - `cache_t`    — per-shape working level: one owner, one thread. Holds the
 !!                    `shape_engine_t` recompute tracker plus every per-shape
 !!                    buffer.
 !!
 !! Every entry point reports through the shared status contract
 !! (`SHAPE_*` codes, library codes >= 100); none of them stop.
+!!
+!! ## Thread model (BREAKING CHANGE at 3.0.0)
+!!
+!! The 2.x promise — cache immutable after creation, concurrent computes on one
+!! cache safe — is WITHDRAWN. It was never true of the recompute engine.
+!!
+!!   - `tables_t` and `node_set_t` are immutable after `tables_init_s` /
+!!     `node_set_build_s`. Share them across threads for concurrent reads.
+!!   - `cache_t` is THREAD-CONFINED. Every compute call mutates it (engine
+!!     bitmask, resolved coefficients, output buffers). Concurrent use of one
+!!     cache from more than one thread is undefined. Give every thread its own.
+!!
+!! The intended pattern is one shared `tables_t` plus one `cache_t` per thread,
+!! built with `cache_init_shared_s`. The shared tables must outlive every cache
+!! and node set built against them — they are referenced, not copied.
+!!
+!! ## Usage pattern
+!!
+!! ```fortran
+!! call tables_init_s(tables, max_l, thetas, status)          ! once, shared
+!! call cache_init_shared_s(cache, tables, n_params, &        ! once per thread
+!!         conserve_volume, apply_com, status)
+!! do i = 1, n_shapes                                         ! many shapes
+!!     call cache_radius_grid_s(cache, params(:, i), radii, status)
+!! end do
+!! call cache_free_s(cache)
+!! call tables_free_s(tables)
+!! ```
+!!
+!! Tier 1 (`compute_*_standalone_s`) needs none of this: it builds, uses and
+!! discards its own tables per call, with no engine and nothing to free.
+!!
+!! ## Dependency map (normative — the contract's documented recompute map)
+!!
+!! The embedded `shape_engine_t` tracks five intermediates. Every dependency
+!! mask is ALL `n_params` bits: the radius is a sum over every beta, so no
+!! per-term caching is possible under the contract's bitwise rule. Changing any
+!! one parameter invalidates all five; repeating a parameter vector recomputes
+!! nothing.
+!!
+!! | # | intermediate  | contents                                          | producer for                                |
+!! |---|---------------|---------------------------------------------------|---------------------------------------------|
+!! | 1 | `I_RESOLVED`   | padded coefficients, Newton-corrected beta10, analytic polar radii | 2–5, node eval, unchecked eval |
+!! | 2 | `I_MIN_RADIUS` | Gauss-Legendre minimum-radius scan verdict        | all checked outputs (validity gate)         |
+!! | 3 | `I_VOLUME`     | volume factor c (exactly 1.0 when the flag is off; declared unconditionally so the map stays static) | 4, 5, node eval |
+!! | 4 | `I_RADII`      | R at the primary thetas, stored already scaled     | `cache_radius_grid_s`, `cache_radius_and_derivative_s` |
+!! | 5 | `I_DERIV`      | dR/dtheta at the primary thetas, stored already scaled | `cache_radius_and_derivative_s`         |
+!!
+!! Output → intermediates needed: `cache_radius_grid_s` 1–4;
+!! `cache_radius_and_derivative_s` 1–5; `cache_resolve_shape_s` 1–3;
+!! `cache_node_radius_and_derivative_s` 1–3 plus a per-call evaluation;
+!! `cache_radius_grid_unchecked_s` 1 only, plus a per-call evaluation.
+!!
+!! Node-set and unchecked evaluations are deliberately uncached: node sets are
+!! caller-owned and unbounded in number, and the unchecked path is a cold
+!! diagnostic route. Cheap steps (padding, polar pre-check arithmetic) recompute
+!! inside intermediate 1; nothing else is declared. 5 of
+!! `SHAPE_MAX_INTERMEDIATES` = 16 are used, leaving room to append.
+!!
+!! Recompute counters are always on: `cache_recompute_count_f(cache, i)` takes
+!! one of the public `BETA_PARAM_I_*` mirrors of the indices above.
+!!
+!! ## Failure semantics
+!!
+!! On ANY nonzero status inside a checked cached compute, the library zero-fills
+!! every output argument and invalidates the whole engine, so the next call runs
+!! cold and no partially-updated state survives. Usage errors are checked in the
+!! contract's normative order, so a call that is wrong in more than one way
+!! reports the earlier code. In particular the output-buffer check runs before
+!! the node-set check: an unbuilt node set has zero nodes, so any non-empty
+!! buffer trips `BETA_PARAM_ERROR_INVALID_BUFFER_SIZE` (104) and only a
+!! zero-length buffer reaches `BETA_PARAM_ERROR_NODE_SET_MISMATCH` (106).
 module beta_parameterization_mod
 
     use precision_utilities_mod, only: ik, ikl, rk
@@ -1115,6 +1189,12 @@ contains
     !! Skipping I_MIN_RADIUS and I_VOLUME costs nothing later: they stay cold,
     !! and a subsequent checked call on the same parameters computes exactly the
     !! stages the unchecked call left out.
+    !!
+    !! CAUTION: the radii come back UNSCALED even on a cache created with
+    !! conserve_volume = .true. — this path never computes the volume factor. A
+    !! caller that mixes this route with `cache_radius_grid_s` on such a cache
+    !! draws two outlines of different size for the same shape. Scale by the
+    !! `volume_factor` from `cache_resolve_shape_s` if the sizes must agree.
     !!
     !! @param[inout] cache   Initialized cache
     !! @param[in]    params  Parameter vector, length == cache n_params

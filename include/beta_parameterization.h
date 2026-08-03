@@ -194,6 +194,12 @@ int beta_param_cache_radius_and_derivative(
  * initialized, wrong parameter count, buffer size, COM non-convergence), so a
  * shape rejected by the checked path still yields its (partly negative)
  * outline instead of a zero-filled buffer.
+ *
+ * CAUTION: the radii are UNSCALED even on a cache created with
+ * conserve_volume = 1 — this path never computes the volume factor. Mixing it
+ * with beta_param_cache_radius_grid() on such a cache draws two outlines of
+ * different size for one shape; scale by beta_param_cache_resolve_shape()'s
+ * volume_factor if the sizes must agree.
  */
 int beta_param_cache_radius_grid_unchecked(
         beta_param_cache_t* cache, const double* params, int n_params,
