@@ -1,0 +1,57 @@
+name: tests
+on:
+  push:
+    branches: [master]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  suites:
+    # ubuntu-24.04 ships gfortran 13, the compiler the library is developed with.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gfortran g++ cmake make
+          gfortran --version | head -1
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+      - name: Build
+        run: cmake --build build -j
+      - name: ctest (Fortran, C and C++ suites)
+        run: ctest --test-dir build --output-on-failure
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: pytest against the built shared library
+        env:
+          BETA_PARAM_LIB: ${{ github.workspace }}/build/libbeta_parameterization.so
+          PYTHONPATH: ${{ github.workspace }}/python
+        run: |
+          python -m pip install --quiet numpy pytest
+          python -m pytest python/tests -q
+  wheel:
+    # The wheel toolchain is GCC 10.2 (manylinux2014), not the GCC 13 above:
+    # build it on every push so a tag never discovers a compile error.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build manylinux2014 wheel in container
+        run: |
+          docker run --rm -v "$PWD":/io -w /io \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_BETA_PARAMETERIZATION=0.0.0 \
+            quay.io/pypa/manylinux2014_x86_64 ./ci/build-wheel.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify wheel in clean venv
+        run: |
+          python -m venv /tmp/verify-wheel
+          /tmp/verify-wheel/bin/pip install wheelhouse/*.whl pytest numpy
+          env -u BETA_PARAM_LIB /tmp/verify-wheel/bin/python -m pytest python/tests -q
