@@ -1,26 +1,29 @@
-!> Contract family 4: boundaries. The two parameter caps (cached tier 2 and
-!! standalone tier 1) and the theta-grid floor must accept the last legal value
-!! and reject the first illegal one with the documented code — off-by-one on
-!! either side is a contract break, so both sides of every edge are asserted.
+!> Contract family 4: boundaries. The parameter limit L = 64 at init, in a
+!! cached call and in a one-shot call, and the theta-grid floor, must accept
+!! the last legal value and reject the first illegal one with the documented
+!! code — off-by-one on either side is a contract break, so both sides of every
+!! edge are asserted.
 program beta_param_boundary_test
     use precision_utilities_mod, only: ik, rk
     use mathematical_and_physical_constants_mod, only: PI_C
-    use test_utils_mod, only: assert_int_eq, test_summary
+    use test_utils_mod, only: assert_true, assert_int_eq, test_summary, bits_equal_f
     use beta_parameterization_mod, only: cache_t, cache_init_s, cache_free_s, &
-            cache_radius_grid_s, &
-            tables_t, tables_init_s, tables_free_s, &
+            cache_radius_grid_s, cache_node_radius_and_derivative_s, &
+            node_set_t, node_set_build_s, node_set_free_s, &
             compute_radius_grid_standalone_s, &
-            SHAPE_CACHE_MAX_PARAMS, SHAPE_STANDALONE_MAX_PARAMS, &
+            SHAPE_MAX_PARAMS, MAX_BETA_PARAMS_LIMIT, &
             SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS, SHAPE_ERROR_INVALID_GRID, &
-            BETA_PARAM_ERROR_POLE_NODE
+            SHAPE_ERROR_WRONG_PARAM_COUNT, SHAPE_ERROR_INVALID_INIT, &
+            BETA_PARAM_ERROR_POLE_NODE, BETA_PARAM_ERROR_NODE_SET_MISMATCH
 
     implicit none
 
     integer(kind = ik), parameter :: N_THETAS = 32_ik
     integer(kind = ik), parameter :: N_PARAMS_SMALL = 2_ik
+    !> The contract's L = min(SHAPE_MAX_PARAMS, N_max).
+    integer(kind = ik), parameter :: LIMIT = min(SHAPE_MAX_PARAMS, MAX_BETA_PARAMS_LIMIT)
 
-    !> A valid eight-parameter shape, used to show the cap value is not merely
-    !! accepted by the init but actually usable.
+    !> A valid eight-parameter shape.
     real(kind = rk), parameter :: PARAMS_8(8) = &
             [0.02_rk, 0.15_rk, 0.08_rk, -0.05_rk, 0.03_rk, 0.01_rk, 0.005_rk, -0.002_rk]
 
@@ -34,115 +37,220 @@ program beta_param_boundary_test
             ['theta = 0   ', 'theta = pi  ', 'theta = 1e-9']
 
     real(kind = rk) :: thetas(N_THETAS)
+    real(kind = rk) :: params_at(LIMIT), params_over(LIMIT + 1_ik)
     integer(kind = ik) :: i
 
     do i = 1_ik, N_THETAS
         thetas(i) = real(i, rk) * PI_C / real(N_THETAS + 1_ik, rk)
     end do
+    ! Alternating, decaying amplitudes: a valid shape at the full length.
+    do i = 1_ik, LIMIT
+        params_at(i) = 0.02_rk / real(i, rk)
+        if (mod(i, 2_ik) == 0_ik) params_at(i) = -params_at(i)
+    end do
+    params_over(1:LIMIT)     = params_at
+    params_over(LIMIT + 1_ik) = 1.0e-4_rk
 
-    call run_cap_mirrors_s()
-    call run_cache_cap_s()
-    call run_standalone_cap_s()
+    call run_limit_value_s()
+    call run_init_limit_s()
+    call run_cached_call_limit_s()
+    call run_one_shot_limit_s()
     call run_grid_floor_s()
     call run_pole_thetas_s()
+    call run_node_set_across_caches_s()
 
     call test_summary()
 
 contains
 
-    !> The two caps are part of the published contract; everything below is
-    !! written against these values.
-    subroutine run_cap_mirrors_s()
-        call assert_int_eq(SHAPE_CACHE_MAX_PARAMS, 8_ik, 'SHAPE_CACHE_MAX_PARAMS == 8')
-        call assert_int_eq(SHAPE_STANDALONE_MAX_PARAMS, 64_ik, 'SHAPE_STANDALONE_MAX_PARAMS == 64')
-    end subroutine run_cap_mirrors_s
+    !> The limit is part of the published contract; everything below is written
+    !! against this value.
+    subroutine run_limit_value_s()
+        call assert_int_eq(LIMIT, 64_ik, 'L == 64')
+    end subroutine run_limit_value_s
 
-    !> Tier 2 accepts exactly SHAPE_CACHE_MAX_PARAMS parameters and rejects one
-    !! more with SHAPE_ERROR_TOO_MANY_PARAMS.
-    subroutine run_cache_cap_s()
-        type(cache_t) :: at_cap, over_cap
-        real(kind = rk) :: radii(N_THETAS)
+    !> Init accepts max_params = L, rejects L + 1 with 1 and 0 with 5.
+    subroutine run_init_limit_s()
+        type(cache_t) :: cache
         integer(kind = ik) :: status
 
-        call cache_init_s(at_cap, SHAPE_CACHE_MAX_PARAMS, thetas, .true., .true., status)
-        call assert_int_eq(status, SHAPE_VALID, 'cache init at the parameter cap')
-        ! The cap is usable, not just accepted.
-        call cache_radius_grid_s(at_cap, PARAMS_8, radii, status)
-        call assert_int_eq(status, SHAPE_VALID, 'compute on a cache at the parameter cap')
-        call cache_free_s(at_cap)
+        call cache_init_s(cache, LIMIT, thetas, status)
+        call assert_int_eq(status, SHAPE_VALID, 'init at max_params = L')
+        call cache_free_s(cache)
 
-        call cache_init_s(over_cap, SHAPE_CACHE_MAX_PARAMS + 1_ik, thetas, &
-                .true., .true., status)
-        call assert_int_eq(status, SHAPE_ERROR_TOO_MANY_PARAMS, &
-                'cache init one parameter over the cap')
-    end subroutine run_cache_cap_s
+        call cache_init_s(cache, LIMIT + 1_ik, thetas, status)
+        call assert_int_eq(status, SHAPE_ERROR_TOO_MANY_PARAMS, 'init at L + 1 rejected with 1')
 
-    !> Tier 1 accepts exactly SHAPE_STANDALONE_MAX_PARAMS parameters — eight
-    !! times the cached cap — and rejects one more the same way.
-    subroutine run_standalone_cap_s()
-        real(kind = rk) :: params_at(SHAPE_STANDALONE_MAX_PARAMS)
-        real(kind = rk) :: params_over(SHAPE_STANDALONE_MAX_PARAMS + 1_ik)
-        real(kind = rk) :: radii(N_THETAS)
+        call cache_init_s(cache, 0_ik, thetas, status)
+        call assert_int_eq(status, SHAPE_ERROR_INVALID_INIT, 'init at 0 rejected with 5')
+    end subroutine run_init_limit_s
+
+    !> A cached call accepts size(params) = max_params and rejects one more, or
+    !! none, with 4. Checked on a small cache and on one at the limit, where
+    !! perturbing the last parameter must change the output (no truncation).
+    subroutine run_cached_call_limit_s()
+        type(cache_t) :: cache
+        real(kind = rk) :: radii(N_THETAS), radii_perturbed(N_THETAS)
+        real(kind = rk) :: no_params(0), perturbed(LIMIT)
         integer(kind = ik) :: status
 
-        params_at(:) = 0.0_rk
-        params_at(2) = 0.1_rk
+        call cache_init_s(cache, 8_ik, thetas, status)
+        call assert_int_eq(status, SHAPE_VALID, 'cache init at max_params = 8')
+        call cache_radius_grid_s(cache, PARAMS_8, .true., .true., radii, status)
+        call assert_int_eq(status, SHAPE_VALID, 'call with size(params) = max_params')
+        call cache_radius_grid_s(cache, params_at(1:9), .true., .true., radii, status)
+        call assert_int_eq(status, SHAPE_ERROR_WRONG_PARAM_COUNT, &
+                'call with max_params + 1 rejected with 4')
+        call cache_radius_grid_s(cache, no_params, .true., .true., radii, status)
+        call assert_int_eq(status, SHAPE_ERROR_WRONG_PARAM_COUNT, &
+                'call with an empty vector rejected with 4')
+        call cache_free_s(cache)
+
+        call cache_init_s(cache, LIMIT, thetas, status)
+        call assert_int_eq(status, SHAPE_VALID, 'cache init at max_params = L')
+        call cache_radius_grid_s(cache, params_at, .true., .true., radii, status)
+        call assert_int_eq(status, SHAPE_VALID, 'cached call with L parameters')
+        perturbed = params_at
+        perturbed(LIMIT) = perturbed(LIMIT) + 1.0e-3_rk
+        call cache_radius_grid_s(cache, perturbed, .true., .true., radii_perturbed, status)
+        call assert_int_eq(status, SHAPE_VALID, 'cached call with the last parameter perturbed')
+        call assert_true(.not. bits_equal_f(radii, radii_perturbed), &
+                'cached: parameter L changes the output')
+        call cache_radius_grid_s(cache, params_over, .true., .true., radii, status)
+        call assert_int_eq(status, SHAPE_ERROR_WRONG_PARAM_COUNT, &
+                'cached call with L + 1 parameters rejected with 4')
+        call cache_free_s(cache)
+    end subroutine run_cached_call_limit_s
+
+    !> A one-shot call accepts L parameters, rejects L + 1 with 1 and an empty
+    !! vector with 4; at L the last parameter changes the output.
+    subroutine run_one_shot_limit_s()
+        real(kind = rk) :: radii(N_THETAS), radii_perturbed(N_THETAS)
+        real(kind = rk) :: no_params(0), perturbed(LIMIT)
+        integer(kind = ik) :: status
+
         call compute_radius_grid_standalone_s(params_at, thetas, .true., .true., &
                 radii, status)
-        call assert_int_eq(status, SHAPE_VALID, 'standalone at the parameter cap')
+        call assert_int_eq(status, SHAPE_VALID, 'one-shot with L parameters')
 
-        params_over(:) = 0.0_rk
-        params_over(2) = 0.1_rk
+        perturbed = params_at
+        perturbed(LIMIT) = perturbed(LIMIT) + 1.0e-3_rk
+        call compute_radius_grid_standalone_s(perturbed, thetas, .true., .true., &
+                radii_perturbed, status)
+        call assert_int_eq(status, SHAPE_VALID, 'one-shot with the last parameter perturbed')
+        call assert_true(.not. bits_equal_f(radii, radii_perturbed), &
+                'one-shot: parameter L changes the output')
+
         call compute_radius_grid_standalone_s(params_over, thetas, .true., .true., &
                 radii, status)
         call assert_int_eq(status, SHAPE_ERROR_TOO_MANY_PARAMS, &
-                'standalone one parameter over the cap')
-    end subroutine run_standalone_cap_s
+                'one-shot with L + 1 parameters rejected with 1')
+
+        call compute_radius_grid_standalone_s(no_params, thetas, .true., .true., &
+                radii, status)
+        call assert_int_eq(status, SHAPE_ERROR_WRONG_PARAM_COUNT, &
+                'one-shot with an empty vector rejected with 4')
+    end subroutine run_one_shot_limit_s
 
     !> Two theta nodes are the fewest the Legendre tables can be built on; one is
-    !! rejected with SHAPE_ERROR_INVALID_GRID. Both levels enforce the same
-    !! floor, because a cache validates its grid through tables_init_s.
+    !! rejected with SHAPE_ERROR_INVALID_GRID at init, at node-set build and in
+    !! the one-shot.
     subroutine run_grid_floor_s()
-        type(tables_t) :: tables
         type(cache_t) :: cache
-        real(kind = rk) :: thetas_2(2), thetas_1(1)
+        type(node_set_t) :: nodes
+        real(kind = rk) :: thetas_2(2), thetas_1(1), radii_2(2), radii_1(1)
         integer(kind = ik) :: status
 
         thetas_2 = [0.7_rk, 2.0_rk]
         thetas_1 = [0.7_rk]
 
-        call tables_init_s(tables, N_PARAMS_SMALL, thetas_2, status)
-        call assert_int_eq(status, SHAPE_VALID, 'tables init on two thetas')
-        call tables_free_s(tables)
+        call cache_init_s(cache, N_PARAMS_SMALL, thetas_1, status)
+        call assert_int_eq(status, SHAPE_ERROR_INVALID_GRID, 'cache init on one theta')
 
-        call cache_init_s(cache, N_PARAMS_SMALL, thetas_2, .true., .true., status)
+        call cache_init_s(cache, N_PARAMS_SMALL, thetas_2, status)
         call assert_int_eq(status, SHAPE_VALID, 'cache init on two thetas')
+
+        call node_set_build_s(nodes, cache, thetas_2, status)
+        call assert_int_eq(status, SHAPE_VALID, 'node set on two thetas')
+        call node_set_build_s(nodes, cache, thetas_1, status)
+        call assert_int_eq(status, SHAPE_ERROR_INVALID_GRID, 'node set on one theta')
         call cache_free_s(cache)
 
-        call tables_init_s(tables, N_PARAMS_SMALL, thetas_1, status)
-        call assert_int_eq(status, SHAPE_ERROR_INVALID_GRID, 'tables init on one theta')
-
-        call cache_init_s(cache, N_PARAMS_SMALL, thetas_1, .true., .true., status)
-        call assert_int_eq(status, SHAPE_ERROR_INVALID_GRID, 'cache init on one theta')
+        call compute_radius_grid_standalone_s(PARAMS_8(1:2), thetas_2, .true., .true., &
+                radii_2, status)
+        call assert_int_eq(status, SHAPE_VALID, 'one-shot on two thetas')
+        call compute_radius_grid_standalone_s(PARAMS_8(1:2), thetas_1, .true., .true., &
+                radii_1, status)
+        call assert_int_eq(status, SHAPE_ERROR_INVALID_GRID, 'one-shot on one theta')
     end subroutine run_grid_floor_s
 
-    !> A polar node is rejected with BETA_PARAM_ERROR_POLE_NODE at both levels,
-    !! including the node that is polar only after rounding.
+    !> A polar node is rejected with BETA_PARAM_ERROR_POLE_NODE at init and at
+    !! node-set build, including the node that is polar only after rounding.
     subroutine run_pole_thetas_s()
-        type(tables_t) :: tables
-        type(cache_t) :: cache
+        type(cache_t) :: cache, good_cache
+        type(node_set_t) :: nodes
         integer(kind = ik) :: k, status
 
-        do k = 1_ik, 3_ik
-            call tables_init_s(tables, N_PARAMS_SMALL, POLE_THETAS(:, k), status)
-            call assert_int_eq(status, BETA_PARAM_ERROR_POLE_NODE, &
-                    'tables init with ' // trim(POLE_NAMES(k)))
+        call cache_init_s(good_cache, N_PARAMS_SMALL, thetas, status)
+        call assert_int_eq(status, SHAPE_VALID, 'pole-test cache init')
 
-            call cache_init_s(cache, N_PARAMS_SMALL, POLE_THETAS(:, k), &
-                    .true., .true., status)
+        do k = 1_ik, 3_ik
+            call cache_init_s(cache, N_PARAMS_SMALL, POLE_THETAS(:, k), status)
             call assert_int_eq(status, BETA_PARAM_ERROR_POLE_NODE, &
                     'cache init with ' // trim(POLE_NAMES(k)))
+
+            call node_set_build_s(nodes, good_cache, POLE_THETAS(:, k), status)
+            call assert_int_eq(status, BETA_PARAM_ERROR_POLE_NODE, &
+                    'node set with ' // trim(POLE_NAMES(k)))
         end do
+        call cache_free_s(good_cache)
     end subroutine run_pole_thetas_s
+
+    !> A node set serves a cache only if it covers every vector that cache
+    !! accepts. The verdict depends on the two objects, never on the vector:
+    !! a short vector and its zero-padded forms get the same status.
+    subroutine run_node_set_across_caches_s()
+        type(cache_t) :: cache_3, cache_8
+        type(node_set_t) :: nodes_3, nodes_8
+        real(kind = rk) :: radii(N_THETAS), drs(N_THETAS)
+        real(kind = rk) :: padded(8)
+        integer(kind = ik) :: status
+
+        padded(:)   = 0.0_rk
+        padded(1:3) = PARAMS_8(1:3)
+
+        call cache_init_s(cache_3, 3_ik, thetas, status)
+        call assert_int_eq(status, SHAPE_VALID, 'cache_3 init')
+        call cache_init_s(cache_8, 8_ik, thetas, status)
+        call assert_int_eq(status, SHAPE_VALID, 'cache_8 init')
+        call node_set_build_s(nodes_3, cache_3, thetas, status)
+        call assert_int_eq(status, SHAPE_VALID, 'nodes_3 build')
+        call node_set_build_s(nodes_8, cache_8, thetas, status)
+        call assert_int_eq(status, SHAPE_VALID, 'nodes_8 build')
+
+        ! small node set through the large cache: 106 whatever the vector length
+        call cache_node_radius_and_derivative_s(cache_8, padded(1:3), nodes_3, &
+                .true., .true., radii, drs, status)
+        call assert_int_eq(status, BETA_PARAM_ERROR_NODE_SET_MISMATCH, &
+                'small node set, length-3 vector')
+        call cache_node_radius_and_derivative_s(cache_8, padded(1:5), nodes_3, &
+                .true., .true., radii, drs, status)
+        call assert_int_eq(status, BETA_PARAM_ERROR_NODE_SET_MISMATCH, &
+                'small node set, vector padded to 5')
+        call cache_node_radius_and_derivative_s(cache_8, padded, nodes_3, &
+                .true., .true., radii, drs, status)
+        call assert_int_eq(status, BETA_PARAM_ERROR_NODE_SET_MISMATCH, &
+                'small node set, vector padded to 8')
+
+        ! large node set through the small cache: accepted
+        call cache_node_radius_and_derivative_s(cache_3, padded(1:3), nodes_8, &
+                .true., .true., radii, drs, status)
+        call assert_int_eq(status, SHAPE_VALID, 'large node set through the small cache')
+
+        call node_set_free_s(nodes_3)
+        call node_set_free_s(nodes_8)
+        call cache_free_s(cache_3)
+        call cache_free_s(cache_8)
+    end subroutine run_node_set_across_caches_s
 
 end program beta_param_boundary_test
