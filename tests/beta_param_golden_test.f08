@@ -135,15 +135,15 @@ contains
         real(kind = rk)    :: r_north, r_south
         integer(kind = ik) :: status
 
-        call cache_init_s(cache, size(params, kind = ik), thetas, conserve_volume, &
-                apply_com, status)
+        call cache_init_s(cache, size(params, kind = ik), thetas, status)
         call assert_int_eq(status, SHAPE_VALID, label // ' init')
 
-        call cache_resolve_shape_s(cache, params, out_corrected_beta10, r_north, &
-                r_south, out_volume_factor, status)
+        call cache_resolve_shape_s(cache, params, conserve_volume, apply_com, &
+                out_corrected_beta10, r_north, r_south, out_volume_factor, status)
         call assert_int_eq(status, SHAPE_VALID, label // ' resolve')
 
-        call cache_radius_grid_s(cache, params, out_radii, status)
+        call cache_radius_grid_s(cache, params, conserve_volume, apply_com, &
+                out_radii, status)
         call assert_int_eq(status, SHAPE_VALID, label // ' radius grid')
 
         call cache_free_s(cache)

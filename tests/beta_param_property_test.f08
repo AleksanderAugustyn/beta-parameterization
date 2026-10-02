@@ -99,11 +99,11 @@ contains
             thetas(i) = real(i, rk) * PI_C / real(N_THETA + 1_ik, rk)
         end do
 
-        call cache_init_s(cache, N_PARAMS, thetas, .false., .true., status)
+        call cache_init_s(cache, N_PARAMS, thetas, status)
         call assert_int_eq(status, SHAPE_VALID, 'com ' // label // ': cache init')
 
-        call cache_resolve_shape_s(cache, params, corrected_beta10, r_north, &
-                r_south, volume_factor, status)
+        call cache_resolve_shape_s(cache, params, .false., .true., corrected_beta10, &
+                r_north, r_south, volume_factor, status)
         call assert_int_eq(status, SHAPE_VALID, 'com ' // label // ': resolve')
         call assert_close(volume_factor, 1.0_rk, 0.0_rk, &
                 'com ' // label // ': volume factor is 1 without conservation')
@@ -138,10 +138,10 @@ contains
             thetas(i) = acos(vol_x(i))
         end do
 
-        call cache_init_s(cache, N_PARAMS, thetas, .true., .true., status)
+        call cache_init_s(cache, N_PARAMS, thetas, status)
         call assert_int_eq(status, SHAPE_VALID, 'volume ' // label // ': cache init')
 
-        call cache_radius_grid_s(cache, params, radii, status)
+        call cache_radius_grid_s(cache, params, .true., .true., radii, status)
         call assert_int_eq(status, SHAPE_VALID, 'volume ' // label // ': radius grid')
 
         volume_integral = 0.0_rk

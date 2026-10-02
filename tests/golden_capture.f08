@@ -62,15 +62,14 @@ contains
 
         write(prefix, '(A,I0,A,A)') 'S', id, ' ', tag
 
-        call cache_init_s(cache, size(params, kind = ik), thetas, conserve_volume, &
-                apply_com, status)
+        call cache_init_s(cache, size(params, kind = ik), thetas, status)
         call require_valid_s(prefix, 'init', status)
 
-        call cache_resolve_shape_s(cache, params, corrected_beta10, r_north, r_south, &
-                volume_factor, status)
+        call cache_resolve_shape_s(cache, params, conserve_volume, apply_com, &
+                corrected_beta10, r_north, r_south, volume_factor, status)
         call require_valid_s(prefix, 'resolve', status)
 
-        call cache_radius_grid_s(cache, params, radii, status)
+        call cache_radius_grid_s(cache, params, conserve_volume, apply_com, radii, status)
         call require_valid_s(prefix, 'radius grid', status)
 
         write(*, '(A,A,A,I0,A,L1,A,L1,A)') '    ! ', trim(prefix), ': n_params = ', &

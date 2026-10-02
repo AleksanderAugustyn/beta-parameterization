@@ -102,7 +102,7 @@ contains
         call compute_gauss_legendre_quadrature_s(N_GL, gl_x, gl_w)
         thetas(:) = acos(gl_x(:))
 
-        call cache_init_s(cache, N_DIMS, thetas, .true., apply_com, status)
+        call cache_init_s(cache, N_DIMS, thetas, status)
         if (status /= SHAPE_VALID) then
             write(*, '(A,I0)') 'error: cache_init_s failed with status ', status
             error stop 1
@@ -132,14 +132,14 @@ contains
             end do
             if (apply_com) params(1) = 0.0_rk
 
-            call cache_resolve_shape_s(cache, params, corrected_beta10, r_north, &
-                    r_south, volume_factor, status)
+            call cache_resolve_shape_s(cache, params, .true., apply_com, &
+                    corrected_beta10, r_north, r_south, volume_factor, status)
 
             select case (status)
             case (SHAPE_VALID)
                 n_valid = n_valid + 1_ikl
 
-                call cache_radius_grid_s(cache, params, radii, status)
+                call cache_radius_grid_s(cache, params, .true., apply_com, radii, status)
                 if (status /= SHAPE_VALID) then
                     ! A resolved shape has already passed every validation stage,
                     ! so only a misuse of the API can fail the grid call here.
