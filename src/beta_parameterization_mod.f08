@@ -1,102 +1,75 @@
 !> Public Fortran API for the beta parameterization library.
 !!
-!! Three levels, from shared to per-shape:
+!! Two tiers (shape parameterization contract, two-tier revision):
 !!
-!!   - `tables_t`   — shared immutable level: everything determined by `max_l`
-!!                    and the primary theta set (normalization constants,
-!!                    Gauss-Legendre quadrature, Legendre tables at the primary
-!!                    thetas). Built once, shared read-only.
-!!   - `node_set_t` — caller-owned extra theta nodes with their own Legendre
-!!                    tables, sized to one `tables_t`. Immutable after build.
-!!   - `cache_t`    — per-shape working level: one owner, one thread. Holds the
-!!                    `shape_engine_t` recompute tracker plus every per-shape
-!!                    buffer.
+!!   - One-shot: `compute_*_standalone_s` computes one shape per call. All
+!!     workspace is internal and discarded on return.
+!!   - Read-only cache: `cache_t` holds everything determined by `max_params`
+!!     and the primary theta set (normalization constants, Gauss-Legendre
+!!     quadrature, Legendre tables). Built once, then shared.
+!!
+!! `node_set_t` is a caller-owned set of extra theta nodes with its own
+!! Legendre tables, built from a cache.
 !!
 !! Every entry point reports through the shared status contract
 !! (`SHAPE_*` codes, library codes >= 100); none of them stop.
+!!
+!! ## Usage pattern
+!!
+!! ```fortran
+!! call cache_init_s(cache, max_params, thetas, status)        ! once
+!! do i = 1, n_shapes                                          ! any thread
+!!     call cache_radius_grid_s(cache, params(:, i), conserve_volume, &
+!!             apply_com, radii, status)
+!! end do
+!! call cache_free_s(cache)
+!! ```
+!!
+!! ## Thread model
+!!
+!! A cache and a node set are immutable after `cache_init_s` /
+!! `node_set_build_s`. Every compute takes them `intent(in)` and is `pure`, so
+!! any number of threads may compute on one cache concurrently. `cache_init_s`
+!! and `cache_free_s` on a cache must not race with any other call on it. The
+!! library holds no mutable module state; parameter-dependent intermediates are
+!! per-call stack scratch.
+!!
+!! ## Parameters
+!!
+!! A cached call accepts `1 <= size(params) <= max_params`; a one-shot call
+!! accepts `1 <= size(params) <= 64`. Missing trailing parameters are zero.
+!! Both tiers trim trailing zero parameters before any arithmetic, so a short
+!! vector and its zero-padded form run the same loops on the same data and
+!! return identical bits. Options (`conserve_volume`, `apply_com`) are
+!! per-call arguments: one cache serves every combination.
 !!
 !! ## Precondition: finite input
 !!
 !! `params` (and every theta) must be finite. Non-finite input is UNDEFINED
 !! BEHAVIOR — the library cannot detect NaN under fast-math, so the validity
-!! gate (`r_north <= threshold` and friends) silently passes and the call
-!! returns `SHAPE_VALID` (0) with NaN outputs. No runtime NaN check exists on
-!! any path; screen inputs before calling.
+!! gate silently passes and the call returns `SHAPE_VALID` (0) with NaN
+!! outputs. No runtime NaN check exists on any path; screen inputs before
+!! calling.
 !!
-!! ## Thread model (BREAKING CHANGE at 3.0.0)
-!!
-!! The 2.x promise — cache immutable after creation, concurrent computes on one
-!! cache safe — is WITHDRAWN. It was never true of the recompute engine.
-!!
-!!   - `tables_t` and `node_set_t` are immutable after `tables_init_s` /
-!!     `node_set_build_s`. Share them across threads for concurrent reads.
-!!   - `cache_t` is THREAD-CONFINED. Every compute call mutates it (engine
-!!     bitmask, resolved coefficients, output buffers). Concurrent use of one
-!!     cache from more than one thread is undefined. Give every thread its own.
-!!
-!! The intended pattern is one shared `tables_t` plus one `cache_t` per thread,
-!! built with `cache_init_shared_s`. The shared tables must outlive every cache
-!! and node set built against them — they are referenced, not copied.
-!!
-!! ## Usage pattern
-!!
-!! ```fortran
-!! call tables_init_s(tables, max_l, thetas, status)          ! once, shared
-!! call cache_init_shared_s(cache, tables, n_params, &        ! once per thread
-!!         conserve_volume, apply_com, status)
-!! do i = 1, n_shapes                                         ! many shapes
-!!     call cache_radius_grid_s(cache, params(:, i), radii, status)
-!! end do
-!! call cache_free_s(cache)
-!! call tables_free_s(tables)
-!! ```
-!!
-!! Tier 1 (`compute_*_standalone_s`) needs none of this: it builds, uses and
-!! discards its own tables per call, with no engine and nothing to free.
-!!
-!! ## Dependency map (normative — the contract's documented recompute map)
-!!
-!! The embedded `shape_engine_t` tracks five intermediates. Every dependency
-!! mask is ALL `n_params` bits: the radius is a sum over every beta, so no
-!! per-term caching is possible under the contract's bitwise rule. Changing any
-!! one parameter invalidates all five; repeating a parameter vector recomputes
-!! nothing.
-!!
-!! | # | intermediate  | contents                                          | producer for                                |
-!! |---|---------------|---------------------------------------------------|---------------------------------------------|
-!! | 1 | `I_RESOLVED`   | padded coefficients, Newton-corrected beta10, analytic polar radii | 2–5, node eval, unchecked eval |
-!! | 2 | `I_MIN_RADIUS` | Gauss-Legendre minimum-radius scan verdict        | all checked outputs (validity gate)         |
-!! | 3 | `I_VOLUME`     | volume factor c (exactly 1.0 when the flag is off; declared unconditionally so the map stays static) | 4, 5, node eval |
-!! | 4 | `I_RADII`      | R at the primary thetas, stored already scaled     | `cache_radius_grid_s`, `cache_radius_and_derivative_s` |
-!! | 5 | `I_DERIV`      | dR/dtheta at the primary thetas, stored already scaled | `cache_radius_and_derivative_s`         |
-!!
-!! Output → intermediates needed: `cache_radius_grid_s` 1–4;
-!! `cache_radius_and_derivative_s` 1–5; `cache_resolve_shape_s` 1–3;
-!! `cache_node_radius_and_derivative_s` 1–3 plus a per-call evaluation;
-!! `cache_radius_grid_unchecked_s` 1 only, plus a per-call evaluation.
-!!
-!! Node-set and unchecked evaluations are deliberately uncached: node sets are
-!! caller-owned and unbounded in number, and the unchecked path is a cold
-!! diagnostic route. Cheap steps (padding, polar pre-check arithmetic) recompute
-!! inside intermediate 1; nothing else is declared. 5 of
-!! `SHAPE_MAX_INTERMEDIATES` = 16 are used, leaving room to append.
-!!
-!! Recompute counters are always on: `cache_recompute_count_f(cache, i)` takes
-!! one of the public `BETA_PARAM_I_*` mirrors of the indices above.
+!! Magnitudes must be physical as well. With `apply_com` the COM quadrature
+!! evaluates R**4 before any validity gate, which overflows for |beta| beyond
+!! about 1e70 — a floating-point trap in Debug builds, Inf arithmetic in
+!! Release. Shapes anywhere near the valid domain have |beta| of order 1.
 !!
 !! ## Failure semantics
 !!
-!! On ANY nonzero status inside a checked cached compute, the library zero-fills
-!! every output argument and invalidates the whole engine, so the next call runs
-!! cold and no partially-updated state survives. Usage errors are checked in the
-!! contract's normative order, so a call that is wrong in more than one way
-!! reports the earlier code. In particular the output-buffer check runs before
-!! the node-set check: an unbuilt node set has zero nodes, so any non-empty
-!! buffer trips `BETA_PARAM_ERROR_INVALID_BUFFER_SIZE` (104) and only a
-!! zero-length buffer reaches `BETA_PARAM_ERROR_NODE_SET_MISMATCH` (106).
+!! Every output argument is zero-filled on entry and stays zero on any nonzero
+!! status. Usage errors are checked in a fixed order and depend on sizes only,
+!! never on parameter values: uninitialized cache (2), parameter count (4),
+!! output buffer size (104), node set (106). The buffer check runs before the
+!! node-set check: an unbuilt node set has zero nodes, so any non-empty buffer
+!! trips `BETA_PARAM_ERROR_INVALID_BUFFER_SIZE` (104) and only a zero-length
+!! buffer reaches `BETA_PARAM_ERROR_NODE_SET_MISMATCH` (106). Shape codes
+!! follow: 103 (COM correction, only with `apply_com`), then 100/101/102 from
+!! the validity gate.
 module beta_parameterization_mod
 
-    use precision_utilities_mod, only: ik, ikl, rk
+    use precision_utilities_mod, only: ik, rk
     use mathematical_utilities_mod, only: &
             compute_spherical_harmonics_normalization_constants_s, &
             compute_gauss_legendre_quadrature_s
@@ -104,11 +77,7 @@ module beta_parameterization_mod
             SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS, &
             SHAPE_ERROR_CACHE_NOT_INITIALIZED, SHAPE_ERROR_INVALID_GRID, &
             SHAPE_ERROR_WRONG_PARAM_COUNT, SHAPE_ERROR_INVALID_INIT, &
-            SHAPE_ERROR_TABLES_NOT_INITIALIZED, &
-            SHAPE_CACHE_MAX_PARAMS, SHAPE_STANDALONE_MAX_PARAMS, &
-            shape_engine_t, shape_engine_init_s, shape_engine_begin_s, &
-            shape_engine_needs_f, shape_engine_note_computed_s, &
-            shape_engine_invalidate_all_s, shape_engine_recompute_count_f
+            SHAPE_MAX_PARAMS
     use beta_parameterization_workers_mod, only: &
             precompute_legendre_table_s, &
             precompute_legendre_derivative_table_s, &
@@ -124,13 +93,13 @@ module beta_parameterization_mod
     ! Public types
     !---------------------------------------------------------------------------
     public :: cache_t
-    public :: tables_t
     public :: node_set_t
 
     !---------------------------------------------------------------------------
-    ! Tables lifecycle
+    ! Cache lifecycle
     !---------------------------------------------------------------------------
-    public :: tables_init_s, tables_free_s, tables_max_l_f, tables_n_thetas_f
+    public :: cache_init_s, cache_free_s
+    public :: cache_max_params_f, cache_n_thetas_f, cache_is_initialized_f
 
     !---------------------------------------------------------------------------
     ! Node-set lifecycle
@@ -138,18 +107,7 @@ module beta_parameterization_mod
     public :: node_set_build_s, node_set_free_s, node_set_n_nodes_f
 
     !---------------------------------------------------------------------------
-    ! Cache lifecycle
-    !---------------------------------------------------------------------------
-    public :: cache_init_s, cache_init_shared_s, cache_free_s
-    public :: cache_n_params_f, cache_n_thetas_f, cache_is_initialized_f
-
-    !---------------------------------------------------------------------------
-    ! Cache introspection (test-facing)
-    !---------------------------------------------------------------------------
-    public :: cache_recompute_count_f
-
-    !---------------------------------------------------------------------------
-    ! Cached computes
+    ! Cached computes (tier 2)
     !---------------------------------------------------------------------------
     public :: cache_resolve_shape_s
     public :: cache_radius_grid_s, cache_radius_and_derivative_s
@@ -157,7 +115,7 @@ module beta_parameterization_mod
     public :: cache_radius_grid_unchecked_s
 
     !---------------------------------------------------------------------------
-    ! Standalone computes (tier 1: no cache, no engine, nothing to free)
+    ! One-shot computes (tier 1)
     !---------------------------------------------------------------------------
     public :: compute_radius_grid_standalone_s
     public :: compute_radius_and_derivative_standalone_s
@@ -165,37 +123,22 @@ module beta_parameterization_mod
     !---------------------------------------------------------------------------
     ! Public limits
     !---------------------------------------------------------------------------
+    !> Highest Legendre order the library supports (the contract's N_max).
     integer(kind = ik), parameter, public :: MAX_BETA_PARAMS_LIMIT = 64_ik
+
+    !> Longest parameter vector either tier accepts.
+    integer(kind = ik), parameter :: PARAM_LIMIT = min(SHAPE_MAX_PARAMS, MAX_BETA_PARAMS_LIMIT)
 
     !> Fixed Gauss-Legendre quadrature order for volume/COM integrals.
     integer(kind = ik), parameter :: N_QUAD = 512_ik
-
-    !---------------------------------------------------------------------------
-    ! Cached intermediates tracked by the embedded shape_engine_t
-    !---------------------------------------------------------------------------
-    !> Test-facing mirrors of the intermediate indices: `cache_recompute_count_f`
-    !! takes one of these. They exist so the contract's minimality suite can name
-    !! what it queries; production code has no reason to use them. The private
-    !! I_* below are defined FROM these, so the two can never drift apart.
-    integer(kind = ik), parameter, public :: BETA_PARAM_I_RESOLVED   = 1_ik
-    integer(kind = ik), parameter, public :: BETA_PARAM_I_MIN_RADIUS = 2_ik
-    integer(kind = ik), parameter, public :: BETA_PARAM_I_VOLUME     = 3_ik
-    integer(kind = ik), parameter, public :: BETA_PARAM_I_RADII      = 4_ik
-    integer(kind = ik), parameter, public :: BETA_PARAM_I_DERIV      = 5_ik
-
-    integer(kind = ik), parameter :: I_RESOLVED = BETA_PARAM_I_RESOLVED, &
-            I_MIN_RADIUS = BETA_PARAM_I_MIN_RADIUS, I_VOLUME = BETA_PARAM_I_VOLUME, &
-            I_RADII = BETA_PARAM_I_RADII, I_DERIV = BETA_PARAM_I_DERIV, &
-            N_INTERMEDIATES = 5_ik
 
     ! Shared contract codes re-exported for consumers
     public :: SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS
     public :: SHAPE_ERROR_CACHE_NOT_INITIALIZED, SHAPE_ERROR_INVALID_GRID
     public :: SHAPE_ERROR_WRONG_PARAM_COUNT, SHAPE_ERROR_INVALID_INIT
-    public :: SHAPE_ERROR_TABLES_NOT_INITIALIZED
-    public :: SHAPE_CACHE_MAX_PARAMS, SHAPE_STANDALONE_MAX_PARAMS
+    public :: SHAPE_MAX_PARAMS
 
-    ! Library codes (contract range >= 100, append-only after 3.0.0)
+    ! Library codes (contract range >= 100, append-only)
     integer(kind = ik), parameter, public :: BETA_PARAM_ERROR_NORTH_POLE          = 100_ik
     integer(kind = ik), parameter, public :: BETA_PARAM_ERROR_SOUTH_POLE          = 101_ik
     integer(kind = ik), parameter, public :: BETA_PARAM_ERROR_INTERIOR_NEGATIVE   = 102_ik
@@ -212,44 +155,49 @@ module beta_parameterization_mod
     !---------------------------------------------------------------------------
     real(kind = rk), parameter :: R_MIN_THRESHOLD = 1.0e-6_rk
 
-    !> Shared immutable level: everything that depends only on `max_l` and the
-    !! primary theta set. Built once, then shared read-only by every consumer
-    !! (node sets, caches, standalone entry points) — no shape data inside.
+    !> Read-only cache: everything that depends only on `max_params` and the
+    !! primary theta set. Built once, then shared read-only by every compute and
+    !! every thread — no shape data inside.
     !!
-    !! A `tables_t` that will be shared with `cache_init_shared_s` MUST be
-    !! declared with the `target` attribute by the caller: the cache keeps a
-    !! pointer to it, and without `target` the association is undefined.
+    !! Every component is allocatable or scalar, so intrinsic assignment is a
+    !! deep copy and re-initializing a live cache releases the old contents
+    !! (`intent(out)`); nothing can leak.
     !!
     !! Invariants:
-    !!   - After a successful `tables_init_s`: is_initialized == .true. and every
+    !!   - After a successful `cache_init_s`: is_initialized == .true. and every
     !!     allocatable component is allocated to its declared shape.
-    !!   - `tables_free_s` restores the default (uninitialized) state.
-    type :: tables_t
+    !!   - A failed `cache_init_s` and `cache_free_s` leave the default
+    !!     (uninitialized) state.
+    type :: cache_t
         private
         logical            :: is_initialized = .false.
-        integer(kind = ik) :: max_l    = 0_ik
-        integer(kind = ik) :: n_thetas = 0_ik
+        integer(kind = ik) :: max_params = 0_ik
+        integer(kind = ik) :: n_thetas   = 0_ik
 
-        real(kind = rk), allocatable :: norm_constants(:)             ! (max_l)
+        real(kind = rk), allocatable :: norm_constants(:)             ! (max_params)
         real(kind = rk), allocatable :: gl_nodes(:)                   ! (N_QUAD)
         real(kind = rk), allocatable :: gl_weights(:)                 ! (N_QUAD)
-        real(kind = rk), allocatable :: legendre_gl(:, :)             ! (N_QUAD, max_l + 1)
+        real(kind = rk), allocatable :: legendre_gl(:, :)             ! (N_QUAD, max_params + 1)
         real(kind = rk), allocatable :: thetas(:)                     ! (n_thetas)
         real(kind = rk), allocatable :: sin_thetas(:)                 ! (n_thetas)
-        real(kind = rk), allocatable :: legendre_primary(:, :)        ! (n_thetas, max_l + 1)
-        real(kind = rk), allocatable :: legendre_primary_deriv(:, :)  ! (n_thetas, max_l + 1)
-    end type tables_t
+        real(kind = rk), allocatable :: legendre_primary(:, :)        ! (n_thetas, max_params + 1)
+        real(kind = rk), allocatable :: legendre_primary_deriv(:, :)  ! (n_thetas, max_params + 1)
+    end type cache_t
 
     !> A caller-owned set of theta nodes with precomputed Legendre P_k and P_k'
-    !! tables sized to one `tables_t`'s max_l. Built once (startup), then reused
+    !! tables sized to one cache's max_params. Built once (startup), then reused
     !! across shapes. Carries no shape data; immutable after build and safe to
-    !! share across threads read-only. Deliberately generic: no dense/folding/
-    !! coulomb vocabulary — the caller owns what a set means.
+    !! share across threads. Deliberately generic: no dense/folding/coulomb
+    !! vocabulary — the caller owns what a set means.
+    !!
+    !! Lifetime (contract rule): the cache a node set was built from must
+    !! outlive it. Free node sets first.
     !!
     !! Invariants:
     !!   - After a successful `node_set_build_s`: is_built == .true., every
-    !!     allocatable component allocated, max_l == the source tables' max_l.
-    !!   - A failed build leaves the default (unbuilt) state — `intent(out)`.
+    !!     allocatable component allocated, max_l == the source cache's
+    !!     max_params.
+    !!   - A failed build leaves the default (unbuilt) state.
     type :: node_set_t
         private
         logical            :: is_built = .false.
@@ -261,86 +209,19 @@ module beta_parameterization_mod
         real(kind = rk), allocatable :: legendre_deriv_table(:, :)  ! P_k'(cos theta_i)
     end type node_set_t
 
-    !> Per-shape working level: the embedded `shape_engine_t` recompute tracker,
-    !! the resolved coefficients, and every per-shape buffer.
-    !!
-    !! ## Ownership
-    !!
-    !! `tp` points at the shared tables. Two modes:
-    !!   - `cache_init_s` (private): the cache heap-allocates its own `tables_t`
-    !!     through `tp` and sets `owns_tables = .true.`; `cache_free_s` frees it.
-    !!   - `cache_init_shared_s`: `tp` points at a caller-owned `tables_t` and
-    !!     `owns_tables = .false.`. **The caller MUST declare that `tables_t`
-    !!     with the `target` attribute** and must keep it alive (and not free it)
-    !!     for the whole lifetime of the cache.
-    !!
-    !! ## `cache_free_s` is mandatory — there is no finalizer
-    !!
-    !! `cache_t` has no `final` binding, and both init routines take
-    !! `intent(out) :: cache`, which default-initializes the cache on entry and
-    !! so nulls `tp` before the previous target can be released. A private-mode
-    !! cache therefore leaks its heap `tables_t` (and every allocatable inside
-    !! it) if you either
-    !!   - re-initialize a live cache (`cache_init_s(c, 4, ...)` then
-    !!     `cache_init_s(c, 6, ...)` with no intervening free), or
-    !!   - let the cache go out of scope without freeing it.
-    !!
-    !! Call `cache_free_s` before every re-initialization and before the cache
-    !! goes out of scope. (A `final` binding is not the fix: `cache_free_s`
-    !! resets through `cache = cache_t()`, whose LHS finalization would recurse.)
-    !!
-    !! ## Never copy-assign a cache_t
-    !!
-    !! Intrinsic assignment (`b = a`, passing by value, storing in an array that
-    !! gets reallocated) copies `tp` and `owns_tables` shallowly, producing a
-    !! dangling pointer or a double free. One cache has one owner and belongs to
-    !! one thread; share the `tables_t` instead, not the cache.
-    !!
-    !! Invariants:
-    !!   - After a successful init: is_initialized == .true., `tp` associated,
-    !!     `radii`/`dr_dthetas` allocated to the primary theta count.
-    !!   - Any failed init leaves the default state (both init routines take
-    !!     `intent(out) :: cache`): is_initialized == .false., `tp` null,
-    !!     owns_tables == .false.
-    type :: cache_t
-        private
-        logical            :: is_initialized  = .false.
-        integer(kind = ik) :: n_params        = 0_ik
-        logical            :: conserve_volume = .false.
-        logical            :: apply_com       = .false.
-
-        type(shape_engine_t) :: engine                  !! Recompute tracker
-
-        type(tables_t), pointer :: tp => null()         !! Shared tables (see Ownership)
-        logical :: owns_tables = .false.                !! .true. => cache_free_s frees tp
-
-        real(kind = rk) :: beta_local(SHAPE_CACHE_MAX_PARAMS) = 0.0_rk
-        real(kind = rk) :: beta_con(SHAPE_CACHE_MAX_PARAMS)   = 0.0_rk
-        real(kind = rk) :: corrected_beta10 = 0.0_rk
-        real(kind = rk) :: r_north          = 0.0_rk
-        real(kind = rk) :: r_south          = 0.0_rk
-        real(kind = rk) :: r_min            = 0.0_rk
-        integer(kind = ik) :: i_min         = 0_ik
-        real(kind = rk) :: volume_factor    = 1.0_rk
-
-        real(kind = rk), allocatable :: radii(:)        ! (tables n_thetas)
-        real(kind = rk), allocatable :: dr_dthetas(:)   ! (tables n_thetas)
-    end type cache_t
-
 contains
 
-    !> Fixed diagnostic string for a status code (spec 3.5).
+    !> Fixed diagnostic string for a status code.
     pure function status_message_f(status) result(msg)
         integer(kind = ik), intent(in) :: status
         character(len = STATUS_MESSAGE_LEN) :: msg
         select case (status)
         case (SHAPE_VALID);                          msg = 'valid'
-        case (SHAPE_ERROR_TOO_MANY_PARAMS);          msg = 'too many parameters for this tier'
+        case (SHAPE_ERROR_TOO_MANY_PARAMS);          msg = 'too many parameters'
         case (SHAPE_ERROR_CACHE_NOT_INITIALIZED);    msg = 'cache not initialized'
         case (SHAPE_ERROR_INVALID_GRID);             msg = 'theta grid below minimum size (2)'
-        case (SHAPE_ERROR_WRONG_PARAM_COUNT);        msg = 'params length differs from n_params'
+        case (SHAPE_ERROR_WRONG_PARAM_COUNT);        msg = 'params length outside 1..max_params'
         case (SHAPE_ERROR_INVALID_INIT);             msg = 'invalid init arguments'
-        case (SHAPE_ERROR_TABLES_NOT_INITIALIZED);   msg = 'tables not initialized'
         case (BETA_PARAM_ERROR_NORTH_POLE);          msg = 'north pole radius not positive'
         case (BETA_PARAM_ERROR_SOUTH_POLE);          msg = 'south pole radius not positive'
         case (BETA_PARAM_ERROR_INTERIOR_NEGATIVE);   msg = 'interior radius not positive'
@@ -353,7 +234,7 @@ contains
     end function status_message_f
 
     !===========================================================================
-    ! TABLES LIFECYCLE
+    ! CACHE LIFECYCLE
     !===========================================================================
 
     !> Reject theta sets that cannot carry Legendre derivative tables.
@@ -361,7 +242,7 @@ contains
     !! @param[in]  thetas  Candidate theta nodes (radians)
     !! @param[out] status  SHAPE_VALID, SHAPE_ERROR_INVALID_GRID or
     !!                     BETA_PARAM_ERROR_POLE_NODE
-    subroutine validate_theta_set_s(thetas, status)
+    pure subroutine validate_theta_set_s(thetas, status)
         real(kind = rk),    intent(in)  :: thetas(:)
         integer(kind = ik), intent(out) :: status
         integer(kind = ik) :: i
@@ -380,124 +261,161 @@ contains
         end do
     end subroutine validate_theta_set_s
 
-    !> Build the shared immutable level for one `max_l` and one primary theta set.
+    !> Build the read-only cache for one `max_params` and one primary theta set.
     !!
-    !! @param[out] tables  Fully populated on success; untouched-by-default state
-    !!                     otherwise (intent(out) resets it on entry)
-    !! @param[in]  max_l   1 <= max_l <= MAX_BETA_PARAMS_LIMIT
-    !! @param[in]  thetas  Primary theta nodes (radians), at least 2, none polar
-    !! @param[out] status  SHAPE_VALID on success, else the rejecting code
-    subroutine tables_init_s(tables, max_l, thetas, status)
-        type(tables_t),     intent(out) :: tables
-        integer(kind = ik), intent(in)  :: max_l
+    !! The Legendre order of every table is `max_params`. Re-initializing a
+    !! live cache is safe: `intent(out)` releases the old contents first.
+    !!
+    !! @param[out] cache       Fully populated on success; default
+    !!                         (uninitialized) state otherwise
+    !! @param[in]  max_params  Longest parameter vector the cache accepts,
+    !!                         1 <= max_params <= 64
+    !! @param[in]  thetas      Primary theta nodes (radians), at least 2, none polar
+    !! @param[out] status      SHAPE_VALID on success, else the rejecting code:
+    !!                         5 (max_params < 1), 1 (max_params > 64),
+    !!                         3 (fewer than 2 thetas, or a table that cannot
+    !!                         be allocated), 105 (pole node)
+    pure subroutine cache_init_s(cache, max_params, thetas, status)
+        type(cache_t),      intent(out) :: cache
+        integer(kind = ik), intent(in)  :: max_params
         real(kind = rk),    intent(in)  :: thetas(:)
         integer(kind = ik), intent(out) :: status
         real(kind = rk), allocatable :: x_primary(:)
         integer(kind = ik) :: i, n
+        integer :: alloc_stat
 
         status = SHAPE_VALID
-        if (max_l < 1_ik .or. max_l > MAX_BETA_PARAMS_LIMIT) then
+        if (max_params < 1_ik) then
             status = SHAPE_ERROR_INVALID_INIT
+            return
+        end if
+        if (max_params > PARAM_LIMIT) then
+            status = SHAPE_ERROR_TOO_MANY_PARAMS
             return
         end if
         call validate_theta_set_s(thetas, status)
         if (status /= SHAPE_VALID) return
 
         n = size(thetas, kind = ik)
-        tables%max_l = max_l
-        tables%n_thetas = n
-        allocate(tables%norm_constants(max_l))
+        allocate(cache%norm_constants(max_params), &
+                cache%gl_nodes(N_QUAD), cache%gl_weights(N_QUAD), &
+                cache%legendre_gl(N_QUAD, max_params + 1_ik), &
+                cache%thetas(n), cache%sin_thetas(n), x_primary(n), &
+                cache%legendre_primary(n, max_params + 1_ik), &
+                cache%legendre_primary_deriv(n, max_params + 1_ik), &
+                stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            ! A multi-object allocate may have succeeded partway: release it.
+            call cache_free_s(cache)
+            status = SHAPE_ERROR_INVALID_GRID
+            return
+        end if
+
+        cache%max_params = max_params
+        cache%n_thetas   = n
         call compute_spherical_harmonics_normalization_constants_s( &
-                tables%norm_constants, max_l)
-        allocate(tables%gl_nodes(N_QUAD), tables%gl_weights(N_QUAD))
+                cache%norm_constants, max_params)
         ! ff signature is (n, nodes, weights); nodes come back DESCENDING in x:
         ! nodes(1) ~ +1 (theta ~ 0, north), nodes(N_QUAD) ~ -1 (theta ~ pi, south)
-        call compute_gauss_legendre_quadrature_s(N_QUAD, tables%gl_nodes, tables%gl_weights)
-        allocate(tables%legendre_gl(N_QUAD, max_l + 1_ik))
-        call precompute_legendre_table_s(tables%gl_nodes, max_l, tables%legendre_gl)
+        call compute_gauss_legendre_quadrature_s(N_QUAD, cache%gl_nodes, cache%gl_weights)
+        call precompute_legendre_table_s(cache%gl_nodes, max_params, cache%legendre_gl)
 
-        allocate(tables%thetas(n), tables%sin_thetas(n), x_primary(n))
-        tables%thetas = thetas
+        cache%thetas = thetas
         do i = 1_ik, n
             x_primary(i) = cos(thetas(i))
-            tables%sin_thetas(i) = sin(thetas(i))
+            cache%sin_thetas(i) = sin(thetas(i))
         end do
-        allocate(tables%legendre_primary(n, max_l + 1_ik))
-        allocate(tables%legendre_primary_deriv(n, max_l + 1_ik))
-        call precompute_legendre_table_s(x_primary, max_l, tables%legendre_primary)
-        call precompute_legendre_derivative_table_s(x_primary, max_l, &
-                tables%legendre_primary, tables%legendre_primary_deriv)
-        tables%is_initialized = .true.
-    end subroutine tables_init_s
+        call precompute_legendre_table_s(x_primary, max_params, cache%legendre_primary)
+        call precompute_legendre_derivative_table_s(x_primary, max_params, &
+                cache%legendre_primary, cache%legendre_primary_deriv)
+        cache%is_initialized = .true.
+    end subroutine cache_init_s
 
-    !> Release the tables. Infallible: intent(out) deallocates every component
-    !! and restores the default component values.
-    pure subroutine tables_free_s(tables)
-        type(tables_t), intent(out) :: tables
-        tables%is_initialized = .false.   ! intent(out) already did this; explicit for clarity
-    end subroutine tables_free_s
+    !> Release the cache. Infallible, and safe on an uninitialized cache:
+    !! intent(out) deallocates every component and restores the defaults.
+    pure subroutine cache_free_s(cache)
+        type(cache_t), intent(out) :: cache
+        cache%is_initialized = .false.   ! intent(out) already did this; explicit for clarity
+    end subroutine cache_free_s
 
-    !> Highest Legendre order the tables were built for; 0 when uninitialized.
-    pure function tables_max_l_f(tables) result(max_l)
-        type(tables_t), intent(in) :: tables
-        integer(kind = ik) :: max_l
-        max_l = 0_ik
-        if (tables%is_initialized) max_l = tables%max_l
-    end function tables_max_l_f
+    !> Longest parameter vector the cache accepts; 0 when uninitialized.
+    pure function cache_max_params_f(cache) result(max_params)
+        type(cache_t), intent(in) :: cache
+        integer(kind = ik) :: max_params
+        max_params = 0_ik
+        if (cache%is_initialized) max_params = cache%max_params
+    end function cache_max_params_f
 
     !> Number of primary theta nodes; 0 when uninitialized.
-    pure function tables_n_thetas_f(tables) result(n)
-        type(tables_t), intent(in) :: tables
+    pure function cache_n_thetas_f(cache) result(n)
+        type(cache_t), intent(in) :: cache
         integer(kind = ik) :: n
         n = 0_ik
-        if (tables%is_initialized) n = tables%n_thetas
-    end function tables_n_thetas_f
+        if (cache%is_initialized) n = cache%n_thetas
+    end function cache_n_thetas_f
+
+    !> .true. only after a successful init and before `cache_free_s`.
+    pure function cache_is_initialized_f(cache) result(ok)
+        type(cache_t), intent(in) :: cache
+        logical :: ok
+        ok = cache%is_initialized
+    end function cache_is_initialized_f
 
     !===========================================================================
     ! NODE-SET LIFECYCLE
     !===========================================================================
 
     !> Precompute P_k and P_k' tables at caller-supplied theta nodes, sized to
-    !! the source tables' max_l.
+    !! the source cache's max_params.
     !!
     !! Pole nodes are rejected (`BETA_PARAM_ERROR_POLE_NODE`): the derivative
-    !! recurrence divides by 1 - x**2. Pole radii come analytically from the
-    !! resolve step instead.
+    !! recurrence divides by 1 - x**2. Pole radii come analytically from
+    !! `cache_resolve_shape_s` instead.
     !!
-    !! @param[out] node_set  Filled on success; unbuilt otherwise (intent(out)
-    !!                       resets it on entry)
-    !! @param[in]  tables    Initialized shared tables; supplies max_l
+    !! @param[out] node_set  Filled on success; unbuilt otherwise
+    !! @param[in]  cache     Initialized cache; supplies max_params. Must
+    !!                       outlive the node set (contract lifetime rule).
     !! @param[in]  thetas    Node angles (radians); any order, need not be uniform
-    !! @param[out] status    SHAPE_VALID on success, else the rejecting code
-    subroutine node_set_build_s(node_set, tables, thetas, status)
+    !! @param[out] status    SHAPE_VALID on success, else the rejecting code:
+    !!                       2 (uninitialized cache), 3 (fewer than 2 thetas, or
+    !!                       a table that cannot be allocated), 105 (pole node)
+    pure subroutine node_set_build_s(node_set, cache, thetas, status)
         type(node_set_t),   intent(out) :: node_set
-        type(tables_t),     intent(in)  :: tables
+        type(cache_t),      intent(in)  :: cache
         real(kind = rk),    intent(in)  :: thetas(:)
         integer(kind = ik), intent(out) :: status
         real(kind = rk), allocatable :: x(:)
         integer(kind = ik) :: i, n
+        integer :: alloc_stat
 
         status = SHAPE_VALID
-        if (.not. tables%is_initialized) then
-            status = SHAPE_ERROR_TABLES_NOT_INITIALIZED
+        if (.not. cache%is_initialized) then
+            status = SHAPE_ERROR_CACHE_NOT_INITIALIZED
             return
         end if
         call validate_theta_set_s(thetas, status)
         if (status /= SHAPE_VALID) return
 
         n = size(thetas, kind = ik)
+        allocate(node_set%thetas(n), node_set%sin_thetas(n), x(n), &
+                node_set%legendre_table(n, cache%max_params + 1_ik), &
+                node_set%legendre_deriv_table(n, cache%max_params + 1_ik), &
+                stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            call node_set_free_s(node_set)
+            status = SHAPE_ERROR_INVALID_GRID
+            return
+        end if
+
         node_set%n_nodes = n
-        node_set%max_l = tables%max_l   ! recorded for the consumer-side mismatch check
-        allocate(node_set%thetas(n), node_set%sin_thetas(n), x(n))
-        node_set%thetas = thetas
+        node_set%max_l   = cache%max_params   ! recorded for the consumer-side mismatch check
+        node_set%thetas  = thetas
         do i = 1_ik, n
             x(i) = cos(thetas(i))
             node_set%sin_thetas(i) = sin(thetas(i))
         end do
-        allocate(node_set%legendre_table(n, tables%max_l + 1_ik))
-        allocate(node_set%legendre_deriv_table(n, tables%max_l + 1_ik))
-        call precompute_legendre_table_s(x, tables%max_l, node_set%legendre_table)
-        call precompute_legendre_derivative_table_s(x, tables%max_l, &
+        call precompute_legendre_table_s(x, cache%max_params, node_set%legendre_table)
+        call precompute_legendre_derivative_table_s(x, cache%max_params, &
                 node_set%legendre_table, node_set%legendre_deriv_table)
         node_set%is_built = .true.
     end subroutine node_set_build_s
@@ -518,215 +436,12 @@ contains
     end function node_set_n_nodes_f
 
     !===========================================================================
-    ! CACHE LIFECYCLE
+    ! SHARED COMPUTE CORES (cache + plain arrays, nothing stored)
     !===========================================================================
-
-    !> Dependency masks for the embedded engine: every intermediate depends on
-    !! every parameter, so each mask is the low `n_params` bits set.
-    !!
-    !! Out-of-range `n_params` yields an all-zero mask: `ishft` past the integer
-    !! width is not defined, and the engine rejects the count before the mask
-    !! value can matter.
-    !!
-    !! @param[in]  n_params  Requested parameter count (may be out of range)
-    !! @param[out] masks     One mask per tracked intermediate
-    pure subroutine engine_masks_s(n_params, masks)
-        integer(kind = ik), intent(in)  :: n_params
-        integer(kind = ik), intent(out) :: masks(N_INTERMEDIATES)
-        masks(:) = 0_ik
-        if (n_params >= 1_ik .and. n_params <= SHAPE_CACHE_MAX_PARAMS) then
-            masks(:) = int(ishft(1_ik, n_params) - 1_ik, ik)
-        end if
-    end subroutine engine_masks_s
-
-    !> Initialize a cache that owns its tables (private mode).
-    !!
-    !! The tables are heap-allocated through `cache%tp` and released by
-    !! `cache_free_s`. Use `cache_init_shared_s` when many caches should share
-    !! one `tables_t`.
-    !!
-    !! **Call `cache_free_s` first when re-initializing a live cache, and again
-    !! before the cache goes out of scope.** There is no finalizer, and
-    !! `intent(out) :: cache` nulls `tp` on entry, so re-initializing without a
-    !! free leaks the previous heap `tables_t` and everything inside it.
-    !!
-    !! @param[out] cache            Ready on success; default (uninitialized)
-    !!                              state on any failure
-    !! @param[in]  n_params         1 <= n_params <= SHAPE_CACHE_MAX_PARAMS
-    !! @param[in]  thetas           Primary theta nodes (radians), at least 2,
-    !!                              none polar
-    !! @param[in]  conserve_volume  Renormalize radii to fixed volume
-    !! @param[in]  apply_com        Apply the centre-of-mass correction
-    !! @param[out] status           SHAPE_VALID on success, else the rejecting code
-    subroutine cache_init_s(cache, n_params, thetas, conserve_volume, apply_com, status)
-        type(cache_t),      intent(out) :: cache
-        integer(kind = ik), intent(in)  :: n_params
-        real(kind = rk),    intent(in)  :: thetas(:)
-        logical,            intent(in)  :: conserve_volume
-        logical,            intent(in)  :: apply_com
-        integer(kind = ik), intent(out) :: status
-
-        integer(kind = ik) :: masks(N_INTERMEDIATES)
-        integer(kind = ik) :: n
-
-        ! Engine first: it owns the n_params contract (< 1 or > 8 rejected here).
-        call engine_masks_s(n_params, masks)
-        call shape_engine_init_s(cache%engine, n_params, masks, status)
-        if (status /= SHAPE_VALID) return
-
-        ! Tables next; tables_init_s also validates the theta set.
-        allocate(cache%tp)
-        call tables_init_s(cache%tp, n_params, thetas, status)
-        if (status /= SHAPE_VALID) then
-            deallocate(cache%tp)
-            nullify(cache%tp)
-            return
-        end if
-        cache%owns_tables = .true.
-
-        n = tables_n_thetas_f(cache%tp)
-        allocate(cache%radii(n), cache%dr_dthetas(n))
-        cache%radii(:)      = 0.0_rk
-        cache%dr_dthetas(:) = 0.0_rk
-
-        cache%n_params        = n_params
-        cache%conserve_volume = conserve_volume
-        cache%apply_com       = apply_com
-        cache%is_initialized  = .true.
-    end subroutine cache_init_s
-
-    !> Initialize a cache over caller-owned shared tables.
-    !!
-    !! The cache stores a pointer to `tables` and never frees it. **The caller
-    !! MUST declare `tables` with the `target` attribute**; without it the
-    !! association is undefined once this routine returns. `tables` must also
-    !! outlive the cache and must not be freed while the cache is in use.
-    !!
-    !! @param[in]  tables           Initialized shared tables; declared `target`
-    !!                              by the caller
-    !! @param[out] cache            Ready on success; default (uninitialized)
-    !!                              state on any failure
-    !! @param[in]  n_params         1 <= n_params <= min(SHAPE_CACHE_MAX_PARAMS,
-    !!                              tables max_l)
-    !! @param[in]  conserve_volume  Renormalize radii to fixed volume
-    !! @param[in]  apply_com        Apply the centre-of-mass correction
-    !! @param[out] status           SHAPE_VALID on success, else the rejecting code
-    subroutine cache_init_shared_s(cache, tables, n_params, conserve_volume, apply_com, status)
-        type(cache_t),      intent(out)        :: cache
-        type(tables_t),     intent(in), target :: tables
-        integer(kind = ik), intent(in)         :: n_params
-        logical,            intent(in)         :: conserve_volume
-        logical,            intent(in)         :: apply_com
-        integer(kind = ik), intent(out)        :: status
-
-        integer(kind = ik) :: masks(N_INTERMEDIATES)
-        integer(kind = ik) :: n
-
-        status = SHAPE_VALID
-        if (.not. tables%is_initialized) then
-            status = SHAPE_ERROR_TABLES_NOT_INITIALIZED
-            return
-        end if
-
-        call engine_masks_s(n_params, masks)
-        call shape_engine_init_s(cache%engine, n_params, masks, status)
-        if (status /= SHAPE_VALID) return
-
-        ! The shared tables cap n_params independently of the engine cap.
-        if (n_params > tables_max_l_f(tables)) then
-            status = SHAPE_ERROR_INVALID_INIT
-            return
-        end if
-
-        cache%tp => tables
-        cache%owns_tables = .false.
-
-        n = tables_n_thetas_f(tables)
-        allocate(cache%radii(n), cache%dr_dthetas(n))
-        cache%radii(:)      = 0.0_rk
-        cache%dr_dthetas(:) = 0.0_rk
-
-        cache%n_params        = n_params
-        cache%conserve_volume = conserve_volume
-        cache%apply_com       = apply_com
-        cache%is_initialized  = .true.
-    end subroutine cache_init_shared_s
-
-    !> Release the cache. Infallible, and safe on an uninitialized cache.
-    !!
-    !! Frees the tables only when the cache owns them (private mode); shared
-    !! tables are left untouched for their owner. `intent(inout)`, not
-    !! `intent(out)`: the ownership flag and the pointer must still be readable
-    !! on entry.
-    !!
-    !! @param[inout] cache  Reset to the default (uninitialized) state
-    subroutine cache_free_s(cache)
-        type(cache_t), intent(inout) :: cache
-        if (cache%owns_tables .and. associated(cache%tp)) then
-            call tables_free_s(cache%tp)
-            deallocate(cache%tp)
-        end if
-        nullify(cache%tp)
-        cache = cache_t()   ! deallocates radii/dr_dthetas, restores defaults
-    end subroutine cache_free_s
-
-    !> Parameter count fixed at init; 0 when uninitialized.
-    pure function cache_n_params_f(cache) result(n)
-        type(cache_t), intent(in) :: cache
-        integer(kind = ik) :: n
-        n = 0_ik
-        if (cache%is_initialized) n = cache%n_params
-    end function cache_n_params_f
-
-    !> Number of primary theta nodes behind this cache; 0 when uninitialized.
-    pure function cache_n_thetas_f(cache) result(n)
-        type(cache_t), intent(in) :: cache
-        integer(kind = ik) :: n
-        n = 0_ik
-        if (cache%is_initialized) then
-            if (associated(cache%tp)) n = tables_n_thetas_f(cache%tp)
-        end if
-    end function cache_n_thetas_f
-
-    !> How many times one cached intermediate was recomputed since this cache
-    !! was initialized. Test-facing: the embedded engine is private, and the
-    !! contract's minimality tests need the counters to prove that a compute
-    !! recomputes exactly what its parameter diff invalidated.
-    !!
-    !! Query with the `BETA_PARAM_I_*` constants. Returns 0 for an uninitialized
-    !! cache (its engine carries no counters) and for an out-of-range index.
-    !! Counters accumulate for the whole life of the cache; a failed compute
-    !! returns the engine to cold but never resets them.
-    !!
-    !! @param[in] cache         Cache to query
-    !! @param[in] intermediate  One of the `BETA_PARAM_I_*` indices
-    pure function cache_recompute_count_f(cache, intermediate) result(n)
-        type(cache_t),      intent(in) :: cache
-        integer(kind = ik), intent(in) :: intermediate
-        integer(kind = ikl) :: n
-        n = 0_ikl
-        if (.not. cache%is_initialized) return
-        n = shape_engine_recompute_count_f(cache%engine, intermediate)
-    end function cache_recompute_count_f
-
-    !> .true. only after a successful init and before `cache_free_s`.
-    pure function cache_is_initialized_f(cache) result(ok)
-        type(cache_t), intent(in) :: cache
-        logical :: ok
-        ok = cache%is_initialized
-    end function cache_is_initialized_f
-
-    !===========================================================================
-    ! SHARED COMPUTE CORES (tables + plain arrays, no cache, no engine)
-    !===========================================================================
-    !
-    ! The cached pipeline and the tier-1 standalone entries run the SAME code
-    ! here — one implementation, so the two paths agree bit for bit. Nothing in
-    ! this section knows about `cache_t`.
 
     !> Normalize the parameters, optionally COM-correct them, take the poles.
     !!
-    !! @param[in]    tables            Initialized tables (norms + GL data)
+    !! @param[in]    cache             Initialized cache (norms + GL data)
     !! @param[in]    apply_com         Apply the centre-of-mass correction
     !! @param[inout] beta_local        Parameters in, COM-corrected values out
     !! @param[out]   beta_con          beta_local(k) x norm_constants(k)
@@ -734,9 +449,9 @@ contains
     !! @param[out]   r_north           R(theta = 0), UNSCALED
     !! @param[out]   r_south           R(theta = pi), UNSCALED
     !! @param[out]   status            SHAPE_VALID or BETA_PARAM_ERROR_COM_NOT_CONVERGED
-    subroutine resolve_core_s(tables, apply_com, beta_local, beta_con, &
+    pure subroutine resolve_core_s(cache, apply_com, beta_local, beta_con, &
             corrected_beta10, r_north, r_south, status)
-        type(tables_t),     intent(in)    :: tables
+        type(cache_t),      intent(in)    :: cache
         logical,            intent(in)    :: apply_com
         real(kind = rk),    intent(inout) :: beta_local(:)
         real(kind = rk),    intent(out)   :: beta_con(:)
@@ -752,12 +467,12 @@ contains
         r_south          = 0.0_rk
         n = size(beta_local, kind = ik)
 
-        beta_con(:) = beta_local(:) * tables%norm_constants(1:n)
+        beta_con(:) = beta_local(:) * cache%norm_constants(1:n)
 
         if (apply_com) then
             call newton_com_correction_s(beta_local, beta_con, &
-                    tables%norm_constants(1:n), tables%gl_nodes, &
-                    tables%gl_weights, tables%legendre_gl, converged, n_iter)
+                    cache%norm_constants(1:n), cache%gl_nodes, &
+                    cache%gl_weights, cache%legendre_gl, converged, n_iter)
             if (.not. converged) then
                 status = BETA_PARAM_ERROR_COM_NOT_CONVERGED
                 return
@@ -778,26 +493,22 @@ contains
     !! Every value here is unscaled: the volume factor is positive, so it cannot
     !! change any sign the check looks at.
     !!
-    !! @param[in]  tables   Initialized tables (GL nodes + Legendre table)
+    !! @param[in]  cache    Initialized cache (GL nodes + Legendre table)
     !! @param[in]  beta_con Resolved beta x norm products
     !! @param[in]  r_north  Unscaled north pole radius
     !! @param[in]  r_south  Unscaled south pole radius
-    !! @param[out] r_min    Smallest radius on the GL grid (0 when a pole fails)
-    !! @param[out] i_min    Its GL index (0 when a pole fails)
     !! @param[out] status   SHAPE_VALID or the rejecting BETA_PARAM_ERROR_* code
-    subroutine validate_core_s(tables, beta_con, r_north, r_south, r_min, i_min, status)
-        type(tables_t),     intent(in)  :: tables
+    pure subroutine validate_core_s(cache, beta_con, r_north, r_south, status)
+        type(cache_t),      intent(in)  :: cache
         real(kind = rk),    intent(in)  :: beta_con(:)
         real(kind = rk),    intent(in)  :: r_north, r_south
-        real(kind = rk),    intent(out) :: r_min
-        integer(kind = ik), intent(out) :: i_min
         integer(kind = ik), intent(out) :: status
 
-        real(kind = rk) :: r_gl(N_QUAD)
+        real(kind = rk)    :: r_gl(N_QUAD)
+        real(kind = rk)    :: r_min
+        integer(kind = ik) :: i_min
 
         status = SHAPE_VALID
-        r_min  = 0.0_rk
-        i_min  = 0_ik
         if (r_north <= R_MIN_THRESHOLD) then
             status = BETA_PARAM_ERROR_NORTH_POLE
             return
@@ -807,7 +518,7 @@ contains
             return
         end if
 
-        call eval_radius_grid_s(beta_con, tables%legendre_gl, r_gl)
+        call eval_radius_grid_s(beta_con, cache%legendre_gl, r_gl)
         call find_min_radius_s(r_gl, r_min, i_min)
 
         if (r_min <= R_MIN_THRESHOLD) then
@@ -823,15 +534,16 @@ contains
 
     !> The radial scale that restores the unit-sphere volume, or 1.
     !!
-    !! Infallible — `validate_core_s` has already guaranteed R > 0 everywhere,
-    !! so the volume integral is positive and the cube root is real.
+    !! Infallible — `validate_core_s` has already guaranteed R > 0 at every
+    !! quadrature node, so the volume integral is positive and the cube root is
+    !! real.
     !!
-    !! @param[in]  tables           Initialized tables (GL data)
+    !! @param[in]  cache            Initialized cache (GL data)
     !! @param[in]  beta_con         Resolved beta x norm products
     !! @param[in]  conserve_volume  .false. yields a factor of exactly 1
     !! @param[out] volume_factor    (2 / volume_integral)^(1/3), or 1
-    subroutine volume_core_s(tables, beta_con, conserve_volume, volume_factor)
-        type(tables_t),  intent(in)  :: tables
+    pure subroutine volume_core_s(cache, beta_con, conserve_volume, volume_factor)
+        type(cache_t),   intent(in)  :: cache
         real(kind = rk), intent(in)  :: beta_con(:)
         logical,         intent(in)  :: conserve_volume
         real(kind = rk), intent(out) :: volume_factor
@@ -839,8 +551,8 @@ contains
         real(kind = rk) :: volume_integral, z_mean_integral
 
         if (conserve_volume) then
-            call compute_com_integrals_s(beta_con, tables%gl_nodes, &
-                    tables%gl_weights, tables%legendre_gl, &
+            call compute_com_integrals_s(beta_con, cache%gl_nodes, &
+                    cache%gl_weights, cache%legendre_gl, &
                     volume_integral, z_mean_integral)
             volume_factor = (2.0_rk / volume_integral)**(1.0_rk / 3.0_rk)
         else
@@ -849,467 +561,372 @@ contains
     end subroutine volume_core_s
 
     !===========================================================================
-    ! CACHED INTERMEDIATES
+    ! PER-CALL PIPELINE
     !===========================================================================
 
-    !> I_RESOLVED: store the parameters, apply the COM correction, take the poles.
+    !> The usage checks every cached compute shares, in contract order.
     !!
-    !! @param[inout] cache   Initialized cache; beta_local/beta_con/
-    !!                       corrected_beta10/r_north/r_south are written
-    !! @param[in]    params  Parameter vector, length == cache%n_params
-    !! @param[out]   status  SHAPE_VALID or BETA_PARAM_ERROR_COM_NOT_CONVERGED
-    subroutine do_resolve_s(cache, params, status)
-        type(cache_t),      intent(inout) :: cache
-        real(kind = rk),    intent(in)    :: params(:)
-        integer(kind = ik), intent(out)   :: status
-
+    !! @param[in]  cache   Cache the caller passed
+    !! @param[in]  params  Parameter vector the caller passed
+    !! @param[out] status  SHAPE_VALID, 2 (uninitialized cache) or 4 (length
+    !!                     outside 1..max_params)
+    pure subroutine check_call_s(cache, params, status)
+        type(cache_t),      intent(in)  :: cache
+        real(kind = rk),    intent(in)  :: params(:)
+        integer(kind = ik), intent(out) :: status
         integer(kind = ik) :: n
 
-        n = cache%n_params
-        cache%beta_local(1:n) = params(1:n)
-        call resolve_core_s(cache%tp, cache%apply_com, cache%beta_local(1:n), &
-                cache%beta_con(1:n), cache%corrected_beta10, cache%r_north, &
-                cache%r_south, status)
-    end subroutine do_resolve_s
-
-    !> I_MIN_RADIUS: reject shapes whose radius is not positive everywhere.
-    !!
-    !! @param[inout] cache   Initialized, already resolved cache; r_min/i_min written
-    !! @param[out]   status  SHAPE_VALID or the rejecting BETA_PARAM_ERROR_* code
-    subroutine do_validate_s(cache, status)
-        type(cache_t),      intent(inout) :: cache
-        integer(kind = ik), intent(out)   :: status
-        call validate_core_s(cache%tp, cache%beta_con(1:cache%n_params), &
-                cache%r_north, cache%r_south, cache%r_min, cache%i_min, status)
-    end subroutine do_validate_s
-
-    !> I_VOLUME: the radial scale that restores the unit-sphere volume.
-    !!
-    !! @param[inout] cache  Initialized, already validated cache; volume_factor written
-    subroutine do_volume_s(cache)
-        type(cache_t), intent(inout) :: cache
-        call volume_core_s(cache%tp, cache%beta_con(1:cache%n_params), &
-                cache%conserve_volume, cache%volume_factor)
-    end subroutine do_volume_s
-
-    !> I_RADII: R(theta) on the primary theta grid, cached already scaled.
-    !!
-    !! Scaling happens here, not at the copy-out boundary: the engine
-    !! invalidates every intermediate whenever a parameter changes (all masks
-    !! are all-params), so a cached `radii` can never outlive the
-    !! `volume_factor` it was scaled with.
-    !!
-    !! @param[inout] cache  Initialized cache with I_VOLUME up to date
-    subroutine do_radii_s(cache)
-        type(cache_t), intent(inout) :: cache
-        call eval_radius_grid_s(cache%beta_con(1:cache%n_params), &
-                cache%tp%legendre_primary, cache%radii)
-        cache%radii(:) = cache%radii(:) * cache%volume_factor
-    end subroutine do_radii_s
-
-    !> I_DERIV: dR/dtheta on the primary theta grid, cached already scaled.
-    !!
-    !! @param[inout] cache  Initialized cache with I_VOLUME up to date
-    subroutine do_deriv_s(cache)
-        type(cache_t), intent(inout) :: cache
-        call eval_radius_derivative_s(cache%beta_con(1:cache%n_params), &
-                cache%tp%legendre_primary_deriv, cache%tp%sin_thetas, &
-                cache%dr_dthetas)
-        cache%dr_dthetas(:) = cache%dr_dthetas(:) * cache%volume_factor
-    end subroutine do_deriv_s
-
-    ! Called AFTER shape_engine_begin_s and the buffer checks (spec precedence:
-    ! param-count status 4 must win over buffer status 104, so begin_s runs
-    ! first in every public routine; a buffer failure then zero-fills and
-    ! invalidates, which wipes the diff state begin_s stored - net effect
-    ! identical to the spec's normative order).
-    !
-    ! `up_to` is the highest intermediate the caller needs; the stages above it
-    ! are left cold. Minimality is part of the contract - a radius-grid call
-    ! must not compute the derivative table.
-    !
-    ! @param[inout] cache   Initialized cache, already through begin_s
-    ! @param[in]    params  The same parameter vector begin_s accepted
-    ! @param[in]    up_to   Highest intermediate to bring up to date (I_* index)
-    ! @param[out]   status  SHAPE_VALID, or the first failing stage's code
-    subroutine ensure_intermediates_s(cache, params, up_to, status)
-        type(cache_t),      intent(inout) :: cache
-        real(kind = rk),    intent(in)    :: params(:)
-        integer(kind = ik), intent(in)    :: up_to
-        integer(kind = ik), intent(out)   :: status
         status = SHAPE_VALID
-        if (shape_engine_needs_f(cache%engine, I_RESOLVED)) then
-            call do_resolve_s(cache, params, status)
-            if (status /= SHAPE_VALID) return
-            call shape_engine_note_computed_s(cache%engine, I_RESOLVED)
+        if (.not. cache%is_initialized) then
+            status = SHAPE_ERROR_CACHE_NOT_INITIALIZED
+            return
         end if
-        if (up_to < I_MIN_RADIUS) return
-        if (shape_engine_needs_f(cache%engine, I_MIN_RADIUS)) then
-            call do_validate_s(cache, status)
-            if (status /= SHAPE_VALID) return
-            call shape_engine_note_computed_s(cache%engine, I_MIN_RADIUS)
-        end if
-        if (up_to < I_VOLUME) return
-        if (shape_engine_needs_f(cache%engine, I_VOLUME)) then
-            call do_volume_s(cache)
-            call shape_engine_note_computed_s(cache%engine, I_VOLUME)
-        end if
-        if (up_to < I_RADII) return
-        if (shape_engine_needs_f(cache%engine, I_RADII)) then
-            call do_radii_s(cache)
-            call shape_engine_note_computed_s(cache%engine, I_RADII)
-        end if
-        if (up_to < I_DERIV) return
-        if (shape_engine_needs_f(cache%engine, I_DERIV)) then
-            call do_deriv_s(cache)
-            call shape_engine_note_computed_s(cache%engine, I_DERIV)
-        end if
-    end subroutine ensure_intermediates_s
+        n = size(params, kind = ik)
+        if (n < 1_ik .or. n > cache%max_params) status = SHAPE_ERROR_WRONG_PARAM_COUNT
+    end subroutine check_call_s
 
-    !> The failure tail every cached compute shares: drop back to cold so the
-    !! next call recomputes from scratch. Callers zero-fill their own outputs.
+    !> Index of the last nonzero parameter, at least 1.
     !!
-    !! @param[inout] cache  Cache whose engine is invalidated
-    pure subroutine fail_invalidate_s(cache)
-        type(cache_t), intent(inout) :: cache
-        call shape_engine_invalidate_all_s(cache%engine)
-    end subroutine fail_invalidate_s
+    !! Trailing zeros are trimmed so that a short vector and its zero-padded
+    !! form reach the kernels as the same data with the same trip count: their
+    !! outputs are then bitwise identical whatever the compiler does with the
+    !! summation loops. `abs(x) > 0` treats -0.0 as zero. Interior zeros stay.
+    !!
+    !! @param[in] params  Parameter vector, size >= 1
+    pure function active_length_f(params) result(n_active)
+        real(kind = rk), intent(in) :: params(:)
+        integer(kind = ik) :: n_active
+        n_active = size(params, kind = ik)
+        do while (n_active > 1_ik)
+            if (abs(params(n_active)) > 0.0_rk) exit
+            n_active = n_active - 1_ik
+        end do
+    end function active_length_f
+
+    !> The front half of every compute: trim, resolve, and (checked paths only)
+    !! validate and take the volume factor. Everything it produces is per-call
+    !! scratch owned by the caller; nothing is stored.
+    !!
+    !! @param[in]  cache             Initialized cache, already through check_call_s
+    !! @param[in]  params            Parameter vector, 1 <= size <= cache max_params
+    !! @param[in]  conserve_volume   Compute the volume factor (checked paths)
+    !! @param[in]  apply_com         Apply the centre-of-mass correction
+    !! @param[in]  checked           .false. stops after the resolve stage
+    !! @param[out] n_active          Active length after trimming
+    !! @param[out] beta_con          Resolved beta x norm products in 1..n_active
+    !! @param[out] corrected_beta10  beta10 after the COM correction
+    !! @param[out] r_north           R(theta = 0), UNSCALED
+    !! @param[out] r_south           R(theta = pi), UNSCALED
+    !! @param[out] volume_factor     Radial scale; 1 when not conserved or unchecked
+    !! @param[out] status            SHAPE_VALID or the first failing stage's code
+    pure subroutine prepare_shape_s(cache, params, conserve_volume, apply_com, checked, &
+            n_active, beta_con, corrected_beta10, r_north, r_south, volume_factor, status)
+        type(cache_t),      intent(in)  :: cache
+        real(kind = rk),    intent(in)  :: params(:)
+        logical,            intent(in)  :: conserve_volume, apply_com, checked
+        integer(kind = ik), intent(out) :: n_active
+        real(kind = rk),    intent(out) :: beta_con(SHAPE_MAX_PARAMS)
+        real(kind = rk),    intent(out) :: corrected_beta10, r_north, r_south, volume_factor
+        integer(kind = ik), intent(out) :: status
+
+        real(kind = rk) :: beta_local(SHAPE_MAX_PARAMS)
+
+        volume_factor = 1.0_rk
+        beta_con(:)   = 0.0_rk
+        n_active = active_length_f(params)
+        beta_local(1:n_active) = params(1:n_active)
+
+        call resolve_core_s(cache, apply_com, beta_local(1:n_active), &
+                beta_con(1:n_active), corrected_beta10, r_north, r_south, status)
+        if (status /= SHAPE_VALID) return
+        if (.not. checked) return
+
+        call validate_core_s(cache, beta_con(1:n_active), r_north, r_south, status)
+        if (status /= SHAPE_VALID) return
+        call volume_core_s(cache, beta_con(1:n_active), conserve_volume, volume_factor)
+    end subroutine prepare_shape_s
 
     !===========================================================================
-    ! CACHED COMPUTES
+    ! CACHED COMPUTES (TIER 2)
     !===========================================================================
 
     !> Resolve one shape: COM-corrected beta10, both pole radii, volume factor.
     !!
     !! The pole radii come out scaled by the volume factor (they are lengths);
-    !! `corrected_beta10` is a deformation parameter and is NOT scaled.
+    !! `corrected_beta10` is a deformation parameter and is NOT scaled. Every
+    !! failure zero-fills all four outputs.
     !!
-    !! Every failure zero-fills all four outputs. A failure after the engine
-    !! accepted the parameters also returns the engine to cold.
-    !!
-    !! @param[inout] cache             Initialized cache
-    !! @param[in]    params            Parameter vector, length == cache n_params
-    !! @param[out]   corrected_beta10  beta10 after the COM correction
-    !! @param[out]   r_north           R(theta = 0) x volume_factor
-    !! @param[out]   r_south           R(theta = pi) x volume_factor
-    !! @param[out]   volume_factor     Radial scale (1 when volume is not conserved)
-    !! @param[out]   status            SHAPE_VALID on success, else the rejecting code
-    subroutine cache_resolve_shape_s(cache, params, corrected_beta10, r_north, &
-            r_south, volume_factor, status)
-        type(cache_t),      intent(inout) :: cache
-        real(kind = rk),    intent(in)    :: params(:)
-        real(kind = rk),    intent(out)   :: corrected_beta10, r_north, r_south, volume_factor
-        integer(kind = ik), intent(out)   :: status
+    !! @param[in]  cache             Initialized cache
+    !! @param[in]  params            Parameter vector, 1 <= size <= cache max_params
+    !! @param[in]  conserve_volume   Renormalize radii to fixed volume
+    !! @param[in]  apply_com         Apply the centre-of-mass correction
+    !! @param[out] corrected_beta10  beta10 after the COM correction
+    !! @param[out] r_north           R(theta = 0) x volume_factor
+    !! @param[out] r_south           R(theta = pi) x volume_factor
+    !! @param[out] volume_factor     Radial scale (exactly 1 when not conserved)
+    !! @param[out] status            SHAPE_VALID on success, else the rejecting code
+    pure subroutine cache_resolve_shape_s(cache, params, conserve_volume, apply_com, &
+            corrected_beta10, r_north, r_south, volume_factor, status)
+        type(cache_t),      intent(in)  :: cache
+        real(kind = rk),    intent(in)  :: params(:)
+        logical,            intent(in)  :: conserve_volume, apply_com
+        real(kind = rk),    intent(out) :: corrected_beta10, r_north, r_south, volume_factor
+        integer(kind = ik), intent(out) :: status
+
+        real(kind = rk)    :: beta_con(SHAPE_MAX_PARAMS)
+        real(kind = rk)    :: beta10, north, south, factor
+        integer(kind = ik) :: n_active
 
         corrected_beta10 = 0.0_rk
         r_north          = 0.0_rk
         r_south          = 0.0_rk
         volume_factor    = 0.0_rk
 
-        if (.not. cache%is_initialized) then
-            status = SHAPE_ERROR_CACHE_NOT_INITIALIZED
-            return
-        end if
-
-        ! begin_s self-invalidates on a wrong parameter count.
-        call shape_engine_begin_s(cache%engine, params, status)
+        call check_call_s(cache, params, status)
         if (status /= SHAPE_VALID) return
 
-        call ensure_intermediates_s(cache, params, I_VOLUME, status)
-        if (status /= SHAPE_VALID) then
-            call fail_invalidate_s(cache)
-            return
-        end if
+        call prepare_shape_s(cache, params, conserve_volume, apply_com, .true., &
+                n_active, beta_con, beta10, north, south, factor, status)
+        if (status /= SHAPE_VALID) return
 
-        corrected_beta10 = cache%corrected_beta10
-        volume_factor    = cache%volume_factor
-        r_north          = cache%r_north * volume_factor
-        r_south          = cache%r_south * volume_factor
+        corrected_beta10 = beta10
+        volume_factor    = factor
+        r_north          = north * factor
+        r_south          = south * factor
     end subroutine cache_resolve_shape_s
 
     !> R(theta) on the cache's primary theta grid, scaled by the volume factor.
     !!
-    !! Computes intermediates 1-4 only: the derivative table stays cold.
-    !! Every failure zero-fills `radii`; a failure after the engine accepted the
-    !! parameters also returns the engine to cold.
+    !! Every failure zero-fills `radii`.
     !!
-    !! @param[inout] cache   Initialized cache
-    !! @param[in]    params  Parameter vector, length == cache n_params
-    !! @param[out]   radii   R(theta_i) x volume_factor; size == cache n_thetas
-    !! @param[out]   status  SHAPE_VALID on success, else the rejecting code
-    subroutine cache_radius_grid_s(cache, params, radii, status)
-        type(cache_t),      intent(inout) :: cache
-        real(kind = rk),    intent(in)    :: params(:)
-        real(kind = rk),    intent(out)   :: radii(:)
-        integer(kind = ik), intent(out)   :: status
+    !! @param[in]  cache            Initialized cache
+    !! @param[in]  params           Parameter vector, 1 <= size <= cache max_params
+    !! @param[in]  conserve_volume  Renormalize radii to fixed volume
+    !! @param[in]  apply_com        Apply the centre-of-mass correction
+    !! @param[out] radii            R(theta_i) x volume_factor; size == cache n_thetas
+    !! @param[out] status           SHAPE_VALID on success, else the rejecting code
+    pure subroutine cache_radius_grid_s(cache, params, conserve_volume, apply_com, &
+            radii, status)
+        type(cache_t),      intent(in)  :: cache
+        real(kind = rk),    intent(in)  :: params(:)
+        logical,            intent(in)  :: conserve_volume, apply_com
+        real(kind = rk),    intent(out) :: radii(:)
+        integer(kind = ik), intent(out) :: status
+
+        real(kind = rk)    :: beta_con(SHAPE_MAX_PARAMS)
+        real(kind = rk)    :: beta10, north, south, factor
+        integer(kind = ik) :: n_active
 
         radii(:) = 0.0_rk
 
-        if (.not. cache%is_initialized) then
-            status = SHAPE_ERROR_CACHE_NOT_INITIALIZED
+        call check_call_s(cache, params, status)
+        if (status /= SHAPE_VALID) return
+        if (size(radii, kind = ik) /= cache%n_thetas) then
+            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
             return
         end if
 
-        ! begin_s self-invalidates on a wrong parameter count, and status 4 must
-        ! win over a bad buffer, so it runs before the size check.
-        call shape_engine_begin_s(cache%engine, params, status)
+        call prepare_shape_s(cache, params, conserve_volume, apply_com, .true., &
+                n_active, beta_con, beta10, north, south, factor, status)
         if (status /= SHAPE_VALID) return
 
-        if (size(radii, kind = ik) /= tables_n_thetas_f(cache%tp)) then
-            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
-            call fail_invalidate_s(cache)
-            return
-        end if
-
-        call ensure_intermediates_s(cache, params, I_RADII, status)
-        if (status /= SHAPE_VALID) then
-            call fail_invalidate_s(cache)
-            return
-        end if
-
-        radii(:) = cache%radii(:)
+        call eval_radius_grid_s(beta_con(1:n_active), cache%legendre_primary, radii)
+        radii(:) = radii(:) * factor
     end subroutine cache_radius_grid_s
 
     !> R(theta) and dR/dtheta on the primary theta grid, both volume-scaled.
     !!
-    !! Computes intermediates 1-5. Both buffers are checked before any compute,
-    !! and every failure zero-fills both.
+    !! Both buffers are checked before any compute, and every failure zero-fills
+    !! both.
     !!
-    !! @param[inout] cache       Initialized cache
-    !! @param[in]    params      Parameter vector, length == cache n_params
-    !! @param[out]   radii       R(theta_i) x volume_factor; size == cache n_thetas
-    !! @param[out]   dr_dthetas  dR/dtheta at theta_i x volume_factor; same size
-    !! @param[out]   status      SHAPE_VALID on success, else the rejecting code
-    subroutine cache_radius_and_derivative_s(cache, params, radii, dr_dthetas, status)
-        type(cache_t),      intent(inout) :: cache
-        real(kind = rk),    intent(in)    :: params(:)
-        real(kind = rk),    intent(out)   :: radii(:), dr_dthetas(:)
-        integer(kind = ik), intent(out)   :: status
+    !! @param[in]  cache            Initialized cache
+    !! @param[in]  params           Parameter vector, 1 <= size <= cache max_params
+    !! @param[in]  conserve_volume  Renormalize radii to fixed volume
+    !! @param[in]  apply_com        Apply the centre-of-mass correction
+    !! @param[out] radii            R(theta_i) x volume_factor; size == cache n_thetas
+    !! @param[out] dr_dthetas       dR/dtheta at theta_i x volume_factor; same size
+    !! @param[out] status           SHAPE_VALID on success, else the rejecting code
+    pure subroutine cache_radius_and_derivative_s(cache, params, conserve_volume, &
+            apply_com, radii, dr_dthetas, status)
+        type(cache_t),      intent(in)  :: cache
+        real(kind = rk),    intent(in)  :: params(:)
+        logical,            intent(in)  :: conserve_volume, apply_com
+        real(kind = rk),    intent(out) :: radii(:), dr_dthetas(:)
+        integer(kind = ik), intent(out) :: status
 
-        integer(kind = ik) :: n
+        real(kind = rk)    :: beta_con(SHAPE_MAX_PARAMS)
+        real(kind = rk)    :: beta10, north, south, factor
+        integer(kind = ik) :: n_active
 
         radii(:)      = 0.0_rk
         dr_dthetas(:) = 0.0_rk
 
-        if (.not. cache%is_initialized) then
-            status = SHAPE_ERROR_CACHE_NOT_INITIALIZED
+        call check_call_s(cache, params, status)
+        if (status /= SHAPE_VALID) return
+        if (size(radii, kind = ik) /= cache%n_thetas .or. &
+                size(dr_dthetas, kind = ik) /= cache%n_thetas) then
+            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
             return
         end if
 
-        call shape_engine_begin_s(cache%engine, params, status)
+        call prepare_shape_s(cache, params, conserve_volume, apply_com, .true., &
+                n_active, beta_con, beta10, north, south, factor, status)
         if (status /= SHAPE_VALID) return
 
-        n = tables_n_thetas_f(cache%tp)
-        if (size(radii, kind = ik) /= n .or. size(dr_dthetas, kind = ik) /= n) then
-            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
-            call fail_invalidate_s(cache)
-            return
-        end if
-
-        call ensure_intermediates_s(cache, params, I_DERIV, status)
-        if (status /= SHAPE_VALID) then
-            call fail_invalidate_s(cache)
-            return
-        end if
-
-        radii(:)      = cache%radii(:)
-        dr_dthetas(:) = cache%dr_dthetas(:)
+        call eval_radius_grid_s(beta_con(1:n_active), cache%legendre_primary, radii)
+        call eval_radius_derivative_s(beta_con(1:n_active), &
+                cache%legendre_primary_deriv, cache%sin_thetas, dr_dthetas)
+        radii(:)      = radii(:) * factor
+        dr_dthetas(:) = dr_dthetas(:) * factor
     end subroutine cache_radius_and_derivative_s
 
     !> R(theta) and dR/dtheta at a caller-owned node set, both volume-scaled.
     !!
-    !! Uncached by design: the node values go straight into the caller's buffers
-    !! and are never stored in the cache, so a cache can serve any number of node
-    !! sets without evicting the primary-grid results. Only intermediates 1-3
-    !! (resolve, validity, volume) are shared with the cached path — those stay
-    !! cached, so the per-node cost is the two table evaluations alone.
+    !! The node set must be built and cover every vector the cache accepts
+    !! (`node_set max_l >= cache max_params`, else
+    !! `BETA_PARAM_ERROR_NODE_SET_MISMATCH`): the check depends on the two
+    !! objects only, never on the vector, so a short vector and its zero-padded
+    !! form get the same status. A node set built from this cache always
+    !! passes. Buffers are checked against the node count first. Every failure
+    !! zero-fills both buffers.
     !!
-    !! The node set must be built and carry Legendre orders up to at least the
-    !! cache parameter count (`BETA_PARAM_ERROR_NODE_SET_MISMATCH`); buffers are
-    !! checked against the node count first. Every failure zero-fills both
-    !! buffers, and a failure after the engine accepted the parameters also
-    !! returns the engine to cold.
-    !!
-    !! @param[inout] cache       Initialized cache
-    !! @param[in]    node_set    Built node set with max_l >= cache n_params
-    !! @param[in]    params      Parameter vector, length == cache n_params
-    !! @param[out]   radii       R(theta_i) x volume_factor; size == node count
-    !! @param[out]   dr_dthetas  dR/dtheta at theta_i x volume_factor; same size
-    !! @param[out]   status      SHAPE_VALID on success, else the rejecting code
-    subroutine cache_node_radius_and_derivative_s(cache, node_set, params, radii, &
-            dr_dthetas, status)
-        type(cache_t),      intent(inout) :: cache
-        type(node_set_t),   intent(in)    :: node_set
-        real(kind = rk),    intent(in)    :: params(:)
-        real(kind = rk),    intent(out)   :: radii(:), dr_dthetas(:)
-        integer(kind = ik), intent(out)   :: status
+    !! @param[in]  cache            Initialized cache
+    !! @param[in]  params           Parameter vector, 1 <= size <= cache max_params
+    !! @param[in]  node_set         Built node set with max_l >= cache max_params
+    !! @param[in]  conserve_volume  Renormalize radii to fixed volume
+    !! @param[in]  apply_com        Apply the centre-of-mass correction
+    !! @param[out] radii            R(theta_i) x volume_factor; size == node count
+    !! @param[out] dr_dthetas       dR/dtheta at theta_i x volume_factor; same size
+    !! @param[out] status           SHAPE_VALID on success, else the rejecting code
+    pure subroutine cache_node_radius_and_derivative_s(cache, params, node_set, &
+            conserve_volume, apply_com, radii, dr_dthetas, status)
+        type(cache_t),      intent(in)  :: cache
+        real(kind = rk),    intent(in)  :: params(:)
+        type(node_set_t),   intent(in)  :: node_set
+        logical,            intent(in)  :: conserve_volume, apply_com
+        real(kind = rk),    intent(out) :: radii(:), dr_dthetas(:)
+        integer(kind = ik), intent(out) :: status
 
-        integer(kind = ik) :: n
+        real(kind = rk)    :: beta_con(SHAPE_MAX_PARAMS)
+        real(kind = rk)    :: beta10, north, south, factor
+        integer(kind = ik) :: n_active, n
 
         radii(:)      = 0.0_rk
         dr_dthetas(:) = 0.0_rk
 
-        if (.not. cache%is_initialized) then
-            status = SHAPE_ERROR_CACHE_NOT_INITIALIZED
-            return
-        end if
-
-        call shape_engine_begin_s(cache%engine, params, status)
+        call check_call_s(cache, params, status)
         if (status /= SHAPE_VALID) return
 
         n = node_set_n_nodes_f(node_set)
         if (size(radii, kind = ik) /= n .or. size(dr_dthetas, kind = ik) /= n) then
             status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
-            call fail_invalidate_s(cache)
             return
         end if
-
-        if (.not. node_set%is_built .or. node_set%max_l < cache%n_params) then
+        if (.not. node_set%is_built .or. node_set%max_l < cache%max_params) then
             status = BETA_PARAM_ERROR_NODE_SET_MISMATCH
-            call fail_invalidate_s(cache)
             return
         end if
 
-        call ensure_intermediates_s(cache, params, I_VOLUME, status)
-        if (status /= SHAPE_VALID) then
-            radii(:)      = 0.0_rk
-            dr_dthetas(:) = 0.0_rk
-            call fail_invalidate_s(cache)
-            return
-        end if
+        call prepare_shape_s(cache, params, conserve_volume, apply_com, .true., &
+                n_active, beta_con, beta10, north, south, factor, status)
+        if (status /= SHAPE_VALID) return
 
-        call eval_radius_grid_s(cache%beta_con(1:cache%n_params), &
-                node_set%legendre_table, radii)
-        call eval_radius_derivative_s(cache%beta_con(1:cache%n_params), &
+        call eval_radius_grid_s(beta_con(1:n_active), node_set%legendre_table, radii)
+        call eval_radius_derivative_s(beta_con(1:n_active), &
                 node_set%legendre_deriv_table, node_set%sin_thetas, dr_dthetas)
-        radii(:)      = radii(:) * cache%volume_factor
-        dr_dthetas(:) = dr_dthetas(:) * cache%volume_factor
+        radii(:)      = radii(:) * factor
+        dr_dthetas(:) = dr_dthetas(:) * factor
     end subroutine cache_node_radius_and_derivative_s
 
     !> R(theta) on the primary grid with validation and volume scaling skipped.
     !!
     !! The rendering path: it resolves the parameters (COM correction included
-    !! when the cache asks for it) and evaluates the Legendre sum, nothing more.
-    !! A shape the validity check would reject comes back as a broken outline
-    !! with SHAPE_VALID instead of an error code — which is the point, since a
-    !! plot of the rejected shape is what explains the rejection.
+    !! when asked for) and evaluates the Legendre sum, nothing more. A shape the
+    !! validity check would reject comes back as a broken outline with
+    !! SHAPE_VALID instead of an error code — which is the point, since a plot
+    !! of the rejected shape is what explains the rejection.
     !!
-    !! Skipping I_MIN_RADIUS and I_VOLUME costs nothing later: they stay cold,
-    !! and a subsequent checked call on the same parameters computes exactly the
-    !! stages the unchecked call left out.
-    !!
-    !! CAUTION: the radii come back UNSCALED even on a cache created with
-    !! conserve_volume = .true. — this path never computes the volume factor. A
-    !! caller that mixes this route with `cache_radius_grid_s` on such a cache
+    !! CAUTION: the radii are UNSCALED — this path never computes the volume
+    !! factor, which is why it takes no `conserve_volume`. A caller that mixes
+    !! this route with `cache_radius_grid_s(..., conserve_volume = .true., ...)`
     !! draws two outlines of different size for the same shape. Scale by the
     !! `volume_factor` from `cache_resolve_shape_s` if the sizes must agree.
     !!
-    !! @param[inout] cache   Initialized cache
-    !! @param[in]    params  Parameter vector, length == cache n_params
-    !! @param[out]   radii   R(theta_i), unscaled; size == cache n_thetas
-    !! @param[out]   status  SHAPE_VALID, or an init/param/buffer/COM code
-    subroutine cache_radius_grid_unchecked_s(cache, params, radii, status)
-        type(cache_t),      intent(inout) :: cache
-        real(kind = rk),    intent(in)    :: params(:)
-        real(kind = rk),    intent(out)   :: radii(:)
-        integer(kind = ik), intent(out)   :: status
+    !! @param[in]  cache      Initialized cache
+    !! @param[in]  params     Parameter vector, 1 <= size <= cache max_params
+    !! @param[in]  apply_com  Apply the centre-of-mass correction
+    !! @param[out] radii      R(theta_i), unscaled; size == cache n_thetas
+    !! @param[out] status     SHAPE_VALID, or a usage code, or 103 (COM)
+    pure subroutine cache_radius_grid_unchecked_s(cache, params, apply_com, radii, status)
+        type(cache_t),      intent(in)  :: cache
+        real(kind = rk),    intent(in)  :: params(:)
+        logical,            intent(in)  :: apply_com
+        real(kind = rk),    intent(out) :: radii(:)
+        integer(kind = ik), intent(out) :: status
+
+        real(kind = rk)    :: beta_con(SHAPE_MAX_PARAMS)
+        real(kind = rk)    :: beta10, north, south, factor
+        integer(kind = ik) :: n_active
 
         radii(:) = 0.0_rk
 
-        if (.not. cache%is_initialized) then
-            status = SHAPE_ERROR_CACHE_NOT_INITIALIZED
+        call check_call_s(cache, params, status)
+        if (status /= SHAPE_VALID) return
+        if (size(radii, kind = ik) /= cache%n_thetas) then
+            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
             return
         end if
 
-        call shape_engine_begin_s(cache%engine, params, status)
+        ! Resolve only: no validity scan, no volume integral.
+        call prepare_shape_s(cache, params, .false., apply_com, .false., &
+                n_active, beta_con, beta10, north, south, factor, status)
         if (status /= SHAPE_VALID) return
 
-        if (size(radii, kind = ik) /= tables_n_thetas_f(cache%tp)) then
-            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
-            call fail_invalidate_s(cache)
-            return
-        end if
-
-        ! I_RESOLVED only: no validity scan, no volume integral.
-        call ensure_intermediates_s(cache, params, I_RESOLVED, status)
-        if (status /= SHAPE_VALID) then
-            call fail_invalidate_s(cache)
-            return
-        end if
-
-        call eval_radius_grid_s(cache%beta_con(1:cache%n_params), &
-                cache%tp%legendre_primary, radii)
+        call eval_radius_grid_s(beta_con(1:n_active), cache%legendre_primary, radii)
     end subroutine cache_radius_grid_unchecked_s
 
     !===========================================================================
-    ! STANDALONE COMPUTES (TIER 1)
+    ! ONE-SHOT COMPUTES (TIER 1)
     !===========================================================================
 
-    !> Build throwaway tables and run resolve -> validate -> volume on them.
+    !> The usage checks both one-shot entries share, in contract order. Nothing
+    !! is built until they all pass.
     !!
-    !! The whole tier-1 pipeline except the final table evaluation, which is the
-    !! only part the two standalone entries do not share. The caller owns
-    !! `tables` and MUST call `tables_free_s` on it on every path, success or
-    !! failure; a failed `tables_init_s` already leaves the default state, so
-    !! freeing then is a no-op.
-    !!
-    !! @param[out] tables           Built here, freed by the caller
-    !! @param[in]  params           Parameter vector, 1 <= size <= tier-1 cap
-    !! @param[in]  thetas           Theta nodes (radians), at least 2, none polar
-    !! @param[in]  conserve_volume  Renormalize radii to fixed volume
-    !! @param[in]  apply_com        Apply the centre-of-mass correction
-    !! @param[out] beta_con         Resolved beta x norm products (allocated here)
-    !! @param[out] volume_factor    Radial scale (1 when volume is not conserved)
-    !! @param[out] status           SHAPE_VALID on success, else the rejecting code
-    subroutine standalone_prepare_s(tables, params, thetas, conserve_volume, &
-            apply_com, beta_con, volume_factor, status)
-        type(tables_t),               intent(out) :: tables
-        real(kind = rk),              intent(in)  :: params(:)
-        real(kind = rk),              intent(in)  :: thetas(:)
-        logical,                      intent(in)  :: conserve_volume, apply_com
-        real(kind = rk), allocatable, intent(out) :: beta_con(:)
-        real(kind = rk),              intent(out) :: volume_factor
-        integer(kind = ik),           intent(out) :: status
+    !! @param[in]  n_params  size(params)
+    !! @param[in]  n_thetas  size(thetas)
+    !! @param[in]  n_radii   size(radii)
+    !! @param[in]  n_derivs  size(dr_dthetas); pass n_radii again when the
+    !!                       entry has no derivative buffer
+    !! @param[out] status    SHAPE_VALID, 4 (empty), 1 (more than 64) or 104
+    pure subroutine check_standalone_s(n_params, n_thetas, n_radii, n_derivs, status)
+        integer(kind = ik), intent(in)  :: n_params, n_thetas, n_radii, n_derivs
+        integer(kind = ik), intent(out) :: status
 
-        real(kind = rk), allocatable :: beta_local(:)
-        real(kind = rk)    :: corrected_beta10, r_north, r_south, r_min
-        integer(kind = ik) :: n_params, i_min
-
-        volume_factor = 1.0_rk
-        n_params = size(params, kind = ik)
-
-        ! tables_init_s owns the theta-set contract (3 / 105).
-        call tables_init_s(tables, n_params, thetas, status)
-        if (status /= SHAPE_VALID) return
-
-        allocate(beta_local(n_params), beta_con(n_params))
-        beta_local(:) = params(:)
-
-        call resolve_core_s(tables, apply_com, beta_local, beta_con, &
-                corrected_beta10, r_north, r_south, status)
-        if (status /= SHAPE_VALID) return
-        call validate_core_s(tables, beta_con, r_north, r_south, r_min, i_min, status)
-        if (status /= SHAPE_VALID) return
-        call volume_core_s(tables, beta_con, conserve_volume, volume_factor)
-    end subroutine standalone_prepare_s
+        status = SHAPE_VALID
+        if (n_params < 1_ik) then
+            status = SHAPE_ERROR_WRONG_PARAM_COUNT
+        else if (n_params > PARAM_LIMIT) then
+            status = SHAPE_ERROR_TOO_MANY_PARAMS
+        else if (n_radii /= n_thetas .or. n_derivs /= n_thetas) then
+            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
+        end if
+    end subroutine check_standalone_s
 
     !> R(theta) on a caller-supplied theta set, with nothing kept between calls.
     !!
-    !! Everything the cached path stores is built here and thrown away, so the
-    !! cost is one full pipeline per call — use a `cache_t` for repeated
-    !! evaluations. The results are identical to the cached ones bit for bit:
-    !! both paths run the same cores over the same tables.
+    !! Builds a local cache with `max_params = size(params)`, calls
+    !! `cache_radius_grid_s` on it and discards it: one pipeline serves both
+    !! tiers, so the results are identical to the cached ones bit for bit. The
+    !! cost is one table build per call — use a `cache_t` for repeated
+    !! evaluations. Every failure zero-fills `radii`.
     !!
-    !! Tier 1 accepts up to `SHAPE_STANDALONE_MAX_PARAMS` parameters (the cache
-    !! cap is lower). Every failure zero-fills `radii`.
-    !!
-    !! @param[in]  params           Parameter vector; its length sets max_l
+    !! @param[in]  params           Parameter vector, 1 <= size <= 64
     !! @param[in]  thetas           Theta nodes (radians), at least 2, none polar
     !! @param[in]  conserve_volume  Renormalize radii to fixed volume
     !! @param[in]  apply_com        Apply the centre-of-mass correction
     !! @param[out] radii            R(theta_i) x volume_factor; size == size(thetas)
     !! @param[out] status           SHAPE_VALID on success, else the rejecting code
-    subroutine compute_radius_grid_standalone_s(params, thetas, conserve_volume, &
+    pure subroutine compute_radius_grid_standalone_s(params, thetas, conserve_volume, &
             apply_com, radii, status)
         real(kind = rk),    intent(in)  :: params(:)
         real(kind = rk),    intent(in)  :: thetas(:)
@@ -1318,55 +935,37 @@ contains
         real(kind = rk),    intent(out) :: radii(:)
         integer(kind = ik), intent(out) :: status
 
-        type(tables_t) :: tables
-        real(kind = rk), allocatable :: beta_con(:)
-        real(kind = rk)    :: volume_factor
-        integer(kind = ik) :: n_params
+        type(cache_t) :: cache
+        integer(kind = ik) :: n_radii
 
         radii(:) = 0.0_rk
-        status   = SHAPE_VALID
+        n_radii  = size(radii, kind = ik)
 
-        ! Cheap contract checks first: nothing is built until they all pass.
-        n_params = size(params, kind = ik)
-        if (n_params < 1_ik) then
-            status = SHAPE_ERROR_INVALID_INIT
-            return
-        end if
-        if (n_params > SHAPE_STANDALONE_MAX_PARAMS) then
-            status = SHAPE_ERROR_TOO_MANY_PARAMS
-            return
-        end if
-        if (size(radii, kind = ik) /= size(thetas, kind = ik)) then
-            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
-            return
-        end if
+        call check_standalone_s(size(params, kind = ik), size(thetas, kind = ik), &
+                n_radii, n_radii, status)
+        if (status /= SHAPE_VALID) return
 
-        call standalone_prepare_s(tables, params, thetas, conserve_volume, &
-                apply_com, beta_con, volume_factor, status)
-        if (status /= SHAPE_VALID) then
-            call tables_free_s(tables)
-            return          ! radii already zero-filled
-        end if
+        ! cache_init_s owns the theta-set contract (3 / 105).
+        call cache_init_s(cache, size(params, kind = ik), thetas, status)
+        if (status /= SHAPE_VALID) return
 
-        call eval_radius_grid_s(beta_con, tables%legendre_primary, radii)
-        radii(:) = radii(:) * volume_factor
-        call tables_free_s(tables)
+        call cache_radius_grid_s(cache, params, conserve_volume, apply_com, radii, status)
     end subroutine compute_radius_grid_standalone_s
 
     !> R(theta) and dR/dtheta on a caller-supplied theta set, nothing kept.
     !!
     !! The derivative twin of `compute_radius_grid_standalone_s`: same contract,
-    !! same cores, both buffers checked before anything is built and both
-    !! zero-filled on every failure.
+    !! same wrapper structure, both buffers checked before anything is built and
+    !! both zero-filled on every failure.
     !!
-    !! @param[in]  params           Parameter vector; its length sets max_l
+    !! @param[in]  params           Parameter vector, 1 <= size <= 64
     !! @param[in]  thetas           Theta nodes (radians), at least 2, none polar
     !! @param[in]  conserve_volume  Renormalize radii to fixed volume
     !! @param[in]  apply_com        Apply the centre-of-mass correction
     !! @param[out] radii            R(theta_i) x volume_factor; size == size(thetas)
     !! @param[out] dr_dthetas       dR/dtheta at theta_i x volume_factor; same size
     !! @param[out] status           SHAPE_VALID on success, else the rejecting code
-    subroutine compute_radius_and_derivative_standalone_s(params, thetas, &
+    pure subroutine compute_radius_and_derivative_standalone_s(params, thetas, &
             conserve_volume, apply_com, radii, dr_dthetas, status)
         real(kind = rk),    intent(in)  :: params(:)
         real(kind = rk),    intent(in)  :: thetas(:)
@@ -1376,44 +975,20 @@ contains
         real(kind = rk),    intent(out) :: dr_dthetas(:)
         integer(kind = ik), intent(out) :: status
 
-        type(tables_t) :: tables
-        real(kind = rk), allocatable :: beta_con(:)
-        real(kind = rk)    :: volume_factor
-        integer(kind = ik) :: n_params, n_thetas
+        type(cache_t) :: cache
 
         radii(:)      = 0.0_rk
         dr_dthetas(:) = 0.0_rk
-        status        = SHAPE_VALID
 
-        n_params = size(params, kind = ik)
-        if (n_params < 1_ik) then
-            status = SHAPE_ERROR_INVALID_INIT
-            return
-        end if
-        if (n_params > SHAPE_STANDALONE_MAX_PARAMS) then
-            status = SHAPE_ERROR_TOO_MANY_PARAMS
-            return
-        end if
-        n_thetas = size(thetas, kind = ik)
-        if (size(radii, kind = ik) /= n_thetas .or. &
-                size(dr_dthetas, kind = ik) /= n_thetas) then
-            status = BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
-            return
-        end if
+        call check_standalone_s(size(params, kind = ik), size(thetas, kind = ik), &
+                size(radii, kind = ik), size(dr_dthetas, kind = ik), status)
+        if (status /= SHAPE_VALID) return
 
-        call standalone_prepare_s(tables, params, thetas, conserve_volume, &
-                apply_com, beta_con, volume_factor, status)
-        if (status /= SHAPE_VALID) then
-            call tables_free_s(tables)
-            return          ! both buffers already zero-filled
-        end if
+        call cache_init_s(cache, size(params, kind = ik), thetas, status)
+        if (status /= SHAPE_VALID) return
 
-        call eval_radius_grid_s(beta_con, tables%legendre_primary, radii)
-        call eval_radius_derivative_s(beta_con, tables%legendre_primary_deriv, &
-                tables%sin_thetas, dr_dthetas)
-        radii(:)      = radii(:) * volume_factor
-        dr_dthetas(:) = dr_dthetas(:) * volume_factor
-        call tables_free_s(tables)
+        call cache_radius_and_derivative_s(cache, params, conserve_volume, apply_com, &
+                radii, dr_dthetas, status)
     end subroutine compute_radius_and_derivative_standalone_s
 
 end module beta_parameterization_mod

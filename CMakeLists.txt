@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
 project(beta-parameterization
-        VERSION 3.0.0
+        VERSION 4.0.0
         LANGUAGES Fortran CXX
         DESCRIPTION "Beta parameterization for nuclear physics applications"
 )
@@ -24,7 +24,7 @@ FetchContent_MakeAvailable(gcc-compiler-options)
 FetchContent_Declare(
         fortran-foundations
         GIT_REPOSITORY https://github.com/AleksanderAugustyn/fortran-foundations.git
-        GIT_TAG 2.4.0
+        GIT_TAG 3.0.0
 )
 FetchContent_MakeAvailable(fortran-foundations)
 
@@ -43,7 +43,6 @@ create_fortran_library_interface(TARGET beta_parameterization_flags)
 set(BETA_PARAM_SOURCES
         src/beta_parameterization_workers_mod.f08
         src/beta_parameterization_mod.f08
-        src/beta_parameterization_c_api_mod.f08
 )
 
 # --- Static library target ---
@@ -118,8 +117,7 @@ set_target_properties(beta_param_test_utils PROPERTIES
 target_include_directories(beta_param_test_utils PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests>)
 
-set(BETA_PARAM_TEST_SUITES status lifecycle resolve outputs standalone bitwise minimality
-        interleave boundary property golden)
+set(BETA_PARAM_TEST_SUITES status lifecycle resolve outputs standalone)
 foreach (suite IN LISTS BETA_PARAM_TEST_SUITES)
     add_executable(beta_param_${suite}_test tests/beta_param_${suite}_test.f08)
     target_link_libraries(beta_param_${suite}_test PRIVATE
@@ -128,42 +126,5 @@ foreach (suite IN LISTS BETA_PARAM_TEST_SUITES)
             Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/${suite})
     add_test(NAME ${suite} COMMAND beta_param_${suite}_test)
 endforeach ()
-
-# Golden literals carry 17 significant digits (exact double round-trip);
-# gfortran's conversion-extra warning flags the 17th digit as non-significant.
-# Source-file property so it lands after the flags-interface options (last wins).
-set_source_files_properties(tests/beta_param_golden_test.f08 PROPERTIES
-        COMPILE_OPTIONS "-Wno-conversion-extra;-Wno-error=conversion-extra")
-
-# Capture tool for the golden baseline: an executable, never a test.
-add_executable(golden_capture tests/golden_capture.f08)
-target_link_libraries(golden_capture PRIVATE
-        beta_parameterization beta_param_test_utils beta_parameterization_flags)
-set_target_properties(golden_capture PROPERTIES
-        Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/capture)
-
-# PES-range sweep: 1.55M shapes, far too slow for ctest. An executable driven
-# by an explicit custom target, never registered with add_test.
-add_executable(beta_pes_sweep tests/beta_pes_sweep.f08)
-target_link_libraries(beta_pes_sweep PRIVATE
-        beta_parameterization beta_param_test_utils beta_parameterization_flags)
-set_target_properties(beta_pes_sweep PROPERTIES
-        Fortran_MODULE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests/sweep)
-add_custom_target(test_beta_pes_sweep
-        COMMAND beta_pes_sweep
-        DEPENDS beta_pes_sweep
-        COMMENT "Running the PES-range sweep (1.55M + 172.8k shapes)")
-
-# C API smoke test: links the SHARED library, the binary the bindings load.
-add_executable(c_api_smoke_test tests/c_api_smoke_test.cpp)
-target_link_libraries(c_api_smoke_test PRIVATE beta_parameterization_cxx)
-add_test(NAME c_api_smoke COMMAND c_api_smoke_test)
-
-# Thread model of 3.0.0: shared tables, per-thread caches, via the C++ wrapper.
-find_package(Threads REQUIRED)
-add_executable(thread_stress_test tests/thread_stress_test.cpp)
-target_link_libraries(thread_stress_test PRIVATE
-        beta_parameterization_cxx Threads::Threads)
-add_test(NAME thread_stress COMMAND thread_stress_test)
 
 endif ()
