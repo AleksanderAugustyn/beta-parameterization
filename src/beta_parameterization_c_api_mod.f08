@@ -1,10 +1,10 @@
 !> C-interop layer for the beta parameterization library (`beta_parameterization.h`).
 !!
-!! Three opaque handles, each a `c_loc` of a heap-allocated derived type:
-!!   - `beta_param_tables_t`   -> `tables_t`   (shared, immutable after create)
-!!   - `beta_param_node_set_t` -> `node_set_t` (shared, immutable after create)
-!!   - `beta_param_cache_t`    -> `cache_t`    (THREAD-CONFINED, mutated by
-!!                                              every compute call)
+!! Two opaque handles, each a `c_loc` of a heap-allocated derived type:
+!!   - `beta_param_cache_t`    -> `cache_t`    (immutable after create)
+!!   - `beta_param_node_set_t` -> `node_set_t` (immutable after create)
+!!
+!! Both may be shared across threads: every compute takes its handles read-only.
 !!
 !! Every `_create` returns a null handle on failure and reports the cause
 !! through a trailing nullable `int* status` (an absent `optional` dummy when C
@@ -14,8 +14,32 @@
 !!
 !! This layer only marshals. Buffer-length and parameter-count contracts are
 !! checked once, in `beta_parameterization_mod`, and their codes are passed
-!! through untouched; the one check that lives here is the NULL-handle guard,
-!! which the Fortran layer cannot see.
+!! through untouched. The checks that live here are the ones the Fortran layer
+!! cannot see: the NULL-handle guard, the negative-count clamp, and the
+!! allocation guard described next.
+!!
+!! ## Marshalling buffers are HEAP, not automatic
+!!
+!! An automatic array is allocated on procedure entry, BEFORE the stated size
+!! reaches the Fortran tier that would reject it. Under Release
+!! (`-fstack-arrays`) a large wrong size argument — the wrong variable passed
+!! as `n_radii` — was therefore a stack overflow instead of a status code.
+!! Every caller-sized marshalling buffer here is `allocatable` with an explicit
+!! `allocate(..., stat = ...)`, so an outsized request either reaches the
+!! Fortran tier (and is rejected there) or fails allocation recoverably.
+!! Allocation failure maps to the code of the size argument implicated:
+!! `n_radii` / `n_nodes` -> 104; `n_thetas` -> 3; `n_params` -> 4 in a cached
+!! call and 1 in a one-shot call (a count that cannot be allocated exceeds 64).
+!! A one-shot call has no output size argument — its buffers are sized by
+!! `n_thetas` — so every buffer failure there is a 3. Negative counts are
+!! clamped to zero and judged by the Fortran tier.
+!!
+!! ## A stated size must be the ACTUAL buffer extent
+!!
+!! The size arguments are a contract, not a bound this layer can verify: an
+!! output dummy is declared with the caller's stated extent, so this layer
+!! zero-fills exactly that many elements. A stated size LARGER than the
+!! caller's real buffer is undefined behaviour that no check here can catch.
 module beta_parameterization_c_api_mod
 
     use, intrinsic :: iso_c_binding, only: &
@@ -23,10 +47,9 @@ module beta_parameterization_c_api_mod
             c_null_ptr, c_null_char
     use precision_utilities_mod, only: ik, rk
     use beta_parameterization_mod, only: &
-            tables_t, cache_t, node_set_t, &
-            tables_init_s, tables_free_s, &
+            cache_t, node_set_t, &
+            cache_init_s, cache_free_s, &
             node_set_build_s, node_set_free_s, &
-            cache_init_s, cache_init_shared_s, cache_free_s, &
             cache_radius_grid_s, cache_radius_and_derivative_s, &
             cache_radius_grid_unchecked_s, cache_resolve_shape_s, &
             cache_node_radius_and_derivative_s, &
@@ -36,7 +59,6 @@ module beta_parameterization_c_api_mod
             SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS, &
             SHAPE_ERROR_CACHE_NOT_INITIALIZED, SHAPE_ERROR_INVALID_GRID, &
             SHAPE_ERROR_WRONG_PARAM_COUNT, SHAPE_ERROR_INVALID_INIT, &
-            SHAPE_ERROR_TABLES_NOT_INITIALIZED, &
             BETA_PARAM_ERROR_NORTH_POLE, BETA_PARAM_ERROR_SOUTH_POLE, &
             BETA_PARAM_ERROR_INTERIOR_NEGATIVE, &
             BETA_PARAM_ERROR_COM_NOT_CONVERGED, &
@@ -48,9 +70,7 @@ module beta_parameterization_c_api_mod
     private
 
     public :: beta_param_status_message
-    public :: beta_param_tables_create, beta_param_tables_destroy
-    public :: beta_param_cache_create, beta_param_cache_create_shared
-    public :: beta_param_cache_destroy
+    public :: beta_param_cache_create, beta_param_cache_destroy
     public :: beta_param_node_set_create, beta_param_node_set_destroy
     public :: beta_param_cache_radius_grid
     public :: beta_param_cache_radius_and_derivative
@@ -72,7 +92,7 @@ module beta_parameterization_c_api_mod
     !! The texts are the `status_message_f` texts: keep the two in sync (a C
     !! caller and a Fortran caller must not read different words for one code).
     integer(kind = ik), parameter :: MSG_LEN = STATUS_MESSAGE_LEN + 1_ik
-    integer(kind = ik), parameter :: N_MSG   = 15_ik
+    integer(kind = ik), parameter :: N_MSG   = 14_ik
 
     !> Codes in column order; column N_MSG is the unknown-code fallback and has
     !! no entry here.
@@ -80,7 +100,6 @@ module beta_parameterization_c_api_mod
             SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS, &
             SHAPE_ERROR_CACHE_NOT_INITIALIZED, SHAPE_ERROR_INVALID_GRID, &
             SHAPE_ERROR_WRONG_PARAM_COUNT, SHAPE_ERROR_INVALID_INIT, &
-            SHAPE_ERROR_TABLES_NOT_INITIALIZED, &
             BETA_PARAM_ERROR_NORTH_POLE, BETA_PARAM_ERROR_SOUTH_POLE, &
             BETA_PARAM_ERROR_INTERIOR_NEGATIVE, &
             BETA_PARAM_ERROR_COM_NOT_CONVERGED, &
@@ -90,12 +109,11 @@ module beta_parameterization_c_api_mod
     character(kind = c_char, len = MSG_LEN), parameter :: MSG_TEXT(N_MSG) = &
             [character(kind = c_char, len = MSG_LEN) :: &
                     'valid' // c_null_char, &
-                    'too many parameters for this tier' // c_null_char, &
+                    'too many parameters' // c_null_char, &
                     'cache not initialized' // c_null_char, &
                     'theta grid below minimum size (2)' // c_null_char, &
-                    'params length differs from n_params' // c_null_char, &
+                    'params length outside 1..max_params' // c_null_char, &
                     'invalid init arguments' // c_null_char, &
-                    'tables not initialized' // c_null_char, &
                     'north pole radius not positive' // c_null_char, &
                     'south pole radius not positive' // c_null_char, &
                     'interior radius not positive' // c_null_char, &
@@ -110,6 +128,14 @@ module beta_parameterization_c_api_mod
                     [MSG_LEN, N_MSG])
 
 contains
+
+    !> A C count as a Fortran extent: negative counts become zero, so the
+    !! Fortran tier sees an empty array and rejects it with its own code.
+    pure function extent_f(n) result(extent)
+        integer(c_int), intent(in) :: n
+        integer(kind = ik) :: extent
+        extent = max(int(n, ik), 0_ik)
+    end function extent_f
 
     !===========================================================================
     ! DIAGNOSTICS
@@ -134,115 +160,42 @@ contains
     end function beta_param_status_message
 
     !===========================================================================
-    ! TABLES LIFECYCLE
+    ! CACHE LIFECYCLE
     !===========================================================================
 
-    !> Build the shared immutable level. Null handle on failure.
-    function beta_param_tables_create(max_l, thetas, n_thetas, status) &
-            result(handle) bind(c, name = 'beta_param_tables_create')
-        integer(c_int), value, intent(in) :: max_l, n_thetas
+    !> Build the read-only cache. Null handle on failure.
+    function beta_param_cache_create(max_params, thetas, n_thetas, status) &
+            result(handle) bind(c, name = 'beta_param_cache_create')
+        integer(c_int), value, intent(in) :: max_params, n_thetas
         real(c_double), intent(in) :: thetas(n_thetas)
         integer(c_int), intent(out), optional :: status   ! NULL-able from C
         type(c_ptr) :: handle
 
-        type(tables_t), pointer :: p
-        integer(kind = ik) :: st
-        real(kind = rk) :: thetas_f(n_thetas)
-
-        handle = c_null_ptr
-        st = SHAPE_ERROR_INVALID_INIT
-        if (n_thetas >= 0_c_int) then
-            thetas_f = real(thetas, rk)
-            allocate(p)
-            call tables_init_s(p, int(max_l, ik), thetas_f, st)
-            if (st == SHAPE_VALID) then
-                handle = c_loc(p)
-            else
-                deallocate(p)
-            end if
-        end if
-        if (present(status)) status = int(st, c_int)
-    end function beta_param_tables_create
-
-    !> Release a tables handle. NULL-safe.
-    subroutine beta_param_tables_destroy(handle) &
-            bind(c, name = 'beta_param_tables_destroy')
-        type(c_ptr), value, intent(in) :: handle
-        type(tables_t), pointer :: p
-        if (.not. c_associated(handle)) return
-        call c_f_pointer(handle, p)
-        call tables_free_s(p)
-        deallocate(p)
-    end subroutine beta_param_tables_destroy
-
-    !===========================================================================
-    ! CACHE LIFECYCLE
-    !===========================================================================
-
-    !> Create a cache owning private tables (max_l = n_params). Null on failure.
-    function beta_param_cache_create(n_params, thetas, n_thetas, &
-            conserve_volume, apply_com, status) &
-            result(handle) bind(c, name = 'beta_param_cache_create')
-        integer(c_int), value, intent(in) :: n_params, n_thetas
-        real(c_double), intent(in) :: thetas(n_thetas)
-        integer(c_int), value, intent(in) :: conserve_volume, apply_com
-        integer(c_int), intent(out), optional :: status
-        type(c_ptr) :: handle
-
         type(cache_t), pointer :: p
+        real(kind = rk), allocatable :: thetas_f(:)
         integer(kind = ik) :: st
-        real(kind = rk) :: thetas_f(n_thetas)
+        integer :: alloc_stat
 
         handle = c_null_ptr
-        st = SHAPE_ERROR_INVALID_INIT
-        if (n_thetas >= 0_c_int) then
-            thetas_f = real(thetas, rk)
-            allocate(p)
-            call cache_init_s(p, int(n_params, ik), thetas_f, &
-                    conserve_volume /= 0_c_int, apply_com /= 0_c_int, st)
-            if (st == SHAPE_VALID) then
-                handle = c_loc(p)
-            else
-                call cache_free_s(p)   ! a failed init may still own tables
-                deallocate(p)
+        st = SHAPE_ERROR_INVALID_GRID          ! thetas cannot be marshalled
+        allocate(thetas_f(extent_f(n_thetas)), stat = alloc_stat)
+        if (alloc_stat == 0) then
+            thetas_f(:) = real(thetas, rk)
+            st = SHAPE_ERROR_INVALID_INIT      ! the handle object cannot be allocated
+            allocate(p, stat = alloc_stat)
+            if (alloc_stat == 0) then
+                call cache_init_s(p, int(max_params, ik), thetas_f, st)
+                if (st == SHAPE_VALID) then
+                    handle = c_loc(p)
+                else
+                    deallocate(p)
+                end if
             end if
         end if
         if (present(status)) status = int(st, c_int)
     end function beta_param_cache_create
 
-    !> Create a cache bound to caller-owned shared tables, which must outlive it.
-    !! Null on failure.
-    function beta_param_cache_create_shared(tables, n_params, &
-            conserve_volume, apply_com, status) &
-            result(handle) bind(c, name = 'beta_param_cache_create_shared')
-        type(c_ptr), value, intent(in) :: tables
-        integer(c_int), value, intent(in) :: n_params
-        integer(c_int), value, intent(in) :: conserve_volume, apply_com
-        integer(c_int), intent(out), optional :: status
-        type(c_ptr) :: handle
-
-        type(cache_t),  pointer :: p
-        type(tables_t), pointer :: tp
-        integer(kind = ik) :: st
-
-        handle = c_null_ptr
-        st = SHAPE_ERROR_TABLES_NOT_INITIALIZED
-        if (c_associated(tables)) then
-            call c_f_pointer(tables, tp)
-            allocate(p)
-            call cache_init_shared_s(p, tp, int(n_params, ik), &
-                    conserve_volume /= 0_c_int, apply_com /= 0_c_int, st)
-            if (st == SHAPE_VALID) then
-                handle = c_loc(p)
-            else
-                call cache_free_s(p)
-                deallocate(p)
-            end if
-        end if
-        if (present(status)) status = int(st, c_int)
-    end function beta_param_cache_create_shared
-
-    !> Release a cache. NULL-safe. Shared tables are left to their owner.
+    !> Release a cache. NULL-safe.
     subroutine beta_param_cache_destroy(handle) &
             bind(c, name = 'beta_param_cache_destroy')
         type(c_ptr), value, intent(in) :: handle
@@ -257,34 +210,38 @@ contains
     ! NODE-SET LIFECYCLE
     !===========================================================================
 
-    !> Build an extra evaluation set against shared tables. Null on failure.
-    function beta_param_node_set_create(tables, thetas, n_thetas, status) &
+    !> Build an extra evaluation set from a cache. Null on failure.
+    function beta_param_node_set_create(cache, thetas, n_thetas, status) &
             result(handle) bind(c, name = 'beta_param_node_set_create')
-        type(c_ptr), value, intent(in) :: tables
+        type(c_ptr), value, intent(in) :: cache
         integer(c_int), value, intent(in) :: n_thetas
         real(c_double), intent(in) :: thetas(n_thetas)
         integer(c_int), intent(out), optional :: status
         type(c_ptr) :: handle
 
         type(node_set_t), pointer :: p
-        type(tables_t),   pointer :: tp
+        type(cache_t),    pointer :: cp
+        real(kind = rk), allocatable :: thetas_f(:)
         integer(kind = ik) :: st
-        real(kind = rk) :: thetas_f(n_thetas)
+        integer :: alloc_stat
 
         handle = c_null_ptr
-        st = SHAPE_ERROR_TABLES_NOT_INITIALIZED
-        if (c_associated(tables)) then
-            call c_f_pointer(tables, tp)
+        st = SHAPE_ERROR_CACHE_NOT_INITIALIZED
+        if (c_associated(cache)) then
+            call c_f_pointer(cache, cp)
             st = SHAPE_ERROR_INVALID_GRID
-            if (n_thetas >= 0_c_int) then
-                thetas_f = real(thetas, rk)
-                allocate(p)
-                call node_set_build_s(p, tp, thetas_f, st)
-                if (st == SHAPE_VALID) then
-                    handle = c_loc(p)
-                else
-                    call node_set_free_s(p)
-                    deallocate(p)
+            allocate(thetas_f(extent_f(n_thetas)), stat = alloc_stat)
+            if (alloc_stat == 0) then
+                thetas_f(:) = real(thetas, rk)
+                st = SHAPE_ERROR_INVALID_INIT
+                allocate(p, stat = alloc_stat)
+                if (alloc_stat == 0) then
+                    call node_set_build_s(p, cp, thetas_f, st)
+                    if (st == SHAPE_VALID) then
+                        handle = c_loc(p)
+                    else
+                        deallocate(p)
+                    end if
                 end if
             end if
         end if
@@ -307,17 +264,20 @@ contains
     !===========================================================================
 
     !> R at the cache's primary thetas.
-    function beta_param_cache_radius_grid(cache, params, n_params, radii, n_radii) &
+    function beta_param_cache_radius_grid(cache, params, n_params, &
+            conserve_volume, apply_com, radii, n_radii) &
             result(status) bind(c, name = 'beta_param_cache_radius_grid')
         type(c_ptr), value, intent(in) :: cache
         integer(c_int), value, intent(in) :: n_params, n_radii
+        integer(c_int), value, intent(in) :: conserve_volume, apply_com
         real(c_double), intent(in)  :: params(n_params)
         real(c_double), intent(out) :: radii(n_radii)
         integer(c_int) :: status
 
         type(cache_t), pointer :: p
+        real(kind = rk), allocatable :: params_f(:), radii_f(:)
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(n_params), radii_f(n_radii)
+        integer :: alloc_stat
 
         radii = 0.0_c_double
         if (.not. c_associated(cache)) then
@@ -325,25 +285,38 @@ contains
             return
         end if
         call c_f_pointer(cache, p)
-        params_f = real(params, rk)
-        call cache_radius_grid_s(p, params_f, radii_f, st)
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(SHAPE_ERROR_WRONG_PARAM_COUNT, c_int)
+            return
+        end if
+        allocate(radii_f(extent_f(n_radii)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(BETA_PARAM_ERROR_INVALID_BUFFER_SIZE, c_int)
+            return
+        end if
+        params_f(:) = real(params, rk)
+        call cache_radius_grid_s(p, params_f, conserve_volume /= 0_c_int, &
+                apply_com /= 0_c_int, radii_f, st)
         radii = real(radii_f, c_double)
         status = int(st, c_int)
     end function beta_param_cache_radius_grid
 
     !> R and dR/dtheta at the cache's primary thetas.
     function beta_param_cache_radius_and_derivative(cache, params, n_params, &
-            radii, dr_dthetas, n_radii) &
+            conserve_volume, apply_com, radii, dr_dthetas, n_radii) &
             result(status) bind(c, name = 'beta_param_cache_radius_and_derivative')
         type(c_ptr), value, intent(in) :: cache
         integer(c_int), value, intent(in) :: n_params, n_radii
+        integer(c_int), value, intent(in) :: conserve_volume, apply_com
         real(c_double), intent(in)  :: params(n_params)
         real(c_double), intent(out) :: radii(n_radii), dr_dthetas(n_radii)
         integer(c_int) :: status
 
         type(cache_t), pointer :: p
+        real(kind = rk), allocatable :: params_f(:), radii_f(:), dr_f(:)
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(n_params), radii_f(n_radii), dr_f(n_radii)
+        integer :: alloc_stat
 
         radii      = 0.0_c_double
         dr_dthetas = 0.0_c_double
@@ -352,8 +325,19 @@ contains
             return
         end if
         call c_f_pointer(cache, p)
-        params_f = real(params, rk)
-        call cache_radius_and_derivative_s(p, params_f, radii_f, dr_f, st)
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(SHAPE_ERROR_WRONG_PARAM_COUNT, c_int)
+            return
+        end if
+        allocate(radii_f(extent_f(n_radii)), dr_f(extent_f(n_radii)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(BETA_PARAM_ERROR_INVALID_BUFFER_SIZE, c_int)
+            return
+        end if
+        params_f(:) = real(params, rk)
+        call cache_radius_and_derivative_s(p, params_f, conserve_volume /= 0_c_int, &
+                apply_com /= 0_c_int, radii_f, dr_f, st)
         radii      = real(radii_f, c_double)
         dr_dthetas = real(dr_f, c_double)
         status = int(st, c_int)
@@ -361,17 +345,19 @@ contains
 
     !> R at the primary thetas with no validation gates and no volume scaling.
     function beta_param_cache_radius_grid_unchecked(cache, params, n_params, &
-            radii, n_radii) &
+            apply_com, radii, n_radii) &
             result(status) bind(c, name = 'beta_param_cache_radius_grid_unchecked')
         type(c_ptr), value, intent(in) :: cache
         integer(c_int), value, intent(in) :: n_params, n_radii
+        integer(c_int), value, intent(in) :: apply_com
         real(c_double), intent(in)  :: params(n_params)
         real(c_double), intent(out) :: radii(n_radii)
         integer(c_int) :: status
 
         type(cache_t), pointer :: p
+        real(kind = rk), allocatable :: params_f(:), radii_f(:)
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(n_params), radii_f(n_radii)
+        integer :: alloc_stat
 
         radii = 0.0_c_double
         if (.not. c_associated(cache)) then
@@ -379,26 +365,39 @@ contains
             return
         end if
         call c_f_pointer(cache, p)
-        params_f = real(params, rk)
-        call cache_radius_grid_unchecked_s(p, params_f, radii_f, st)
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(SHAPE_ERROR_WRONG_PARAM_COUNT, c_int)
+            return
+        end if
+        allocate(radii_f(extent_f(n_radii)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(BETA_PARAM_ERROR_INVALID_BUFFER_SIZE, c_int)
+            return
+        end if
+        params_f(:) = real(params, rk)
+        call cache_radius_grid_unchecked_s(p, params_f, apply_com /= 0_c_int, radii_f, st)
         radii = real(radii_f, c_double)
         status = int(st, c_int)
     end function beta_param_cache_radius_grid_unchecked
 
     !> COM-corrected beta10, analytic polar radii and the applied volume factor.
     function beta_param_cache_resolve_shape(cache, params, n_params, &
+            conserve_volume, apply_com, &
             corrected_beta10, r_north, r_south, volume_factor) &
             result(status) bind(c, name = 'beta_param_cache_resolve_shape')
         type(c_ptr), value, intent(in) :: cache
         integer(c_int), value, intent(in) :: n_params
+        integer(c_int), value, intent(in) :: conserve_volume, apply_com
         real(c_double), intent(in)  :: params(n_params)
         real(c_double), intent(out) :: corrected_beta10, r_north, r_south, volume_factor
         integer(c_int) :: status
 
         type(cache_t), pointer :: p
-        integer(kind = ik) :: st
-        real(kind = rk) :: params_f(n_params)
+        real(kind = rk), allocatable :: params_f(:)
         real(kind = rk) :: beta10_f, r_north_f, r_south_f, volume_f
+        integer(kind = ik) :: st
+        integer :: alloc_stat
 
         corrected_beta10 = 0.0_c_double
         r_north          = 0.0_c_double
@@ -409,9 +408,14 @@ contains
             return
         end if
         call c_f_pointer(cache, p)
-        params_f = real(params, rk)
-        call cache_resolve_shape_s(p, params_f, beta10_f, r_north_f, r_south_f, &
-                volume_f, st)
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(SHAPE_ERROR_WRONG_PARAM_COUNT, c_int)
+            return
+        end if
+        params_f(:) = real(params, rk)
+        call cache_resolve_shape_s(p, params_f, conserve_volume /= 0_c_int, &
+                apply_com /= 0_c_int, beta10_f, r_north_f, r_south_f, volume_f, st)
         corrected_beta10 = real(beta10_f, c_double)
         r_north          = real(r_north_f, c_double)
         r_south          = real(r_south_f, c_double)
@@ -419,20 +423,22 @@ contains
         status = int(st, c_int)
     end function beta_param_cache_resolve_shape
 
-    !> R and dR/dtheta at a node set's thetas (uncached evaluation).
-    function beta_param_cache_node_radius_and_derivative(cache, node_set, &
-            params, n_params, radii, dr_dthetas, n_nodes) &
+    !> R and dR/dtheta at a node set's thetas.
+    function beta_param_cache_node_radius_and_derivative(cache, params, n_params, &
+            node_set, conserve_volume, apply_com, radii, dr_dthetas, n_nodes) &
             result(status) bind(c, name = 'beta_param_cache_node_radius_and_derivative')
         type(c_ptr), value, intent(in) :: cache, node_set
         integer(c_int), value, intent(in) :: n_params, n_nodes
+        integer(c_int), value, intent(in) :: conserve_volume, apply_com
         real(c_double), intent(in)  :: params(n_params)
         real(c_double), intent(out) :: radii(n_nodes), dr_dthetas(n_nodes)
         integer(c_int) :: status
 
         type(cache_t),    pointer :: p
         type(node_set_t), pointer :: ns
+        real(kind = rk), allocatable :: params_f(:), radii_f(:), dr_f(:)
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(n_params), radii_f(n_nodes), dr_f(n_nodes)
+        integer :: alloc_stat
 
         radii      = 0.0_c_double
         dr_dthetas = 0.0_c_double
@@ -442,18 +448,29 @@ contains
         end if
         call c_f_pointer(cache, p)
         call c_f_pointer(node_set, ns)
-        params_f = real(params, rk)
-        call cache_node_radius_and_derivative_s(p, ns, params_f, radii_f, dr_f, st)
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(SHAPE_ERROR_WRONG_PARAM_COUNT, c_int)
+            return
+        end if
+        allocate(radii_f(extent_f(n_nodes)), dr_f(extent_f(n_nodes)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(BETA_PARAM_ERROR_INVALID_BUFFER_SIZE, c_int)
+            return
+        end if
+        params_f(:) = real(params, rk)
+        call cache_node_radius_and_derivative_s(p, params_f, ns, &
+                conserve_volume /= 0_c_int, apply_com /= 0_c_int, radii_f, dr_f, st)
         radii      = real(radii_f, c_double)
         dr_dthetas = real(dr_f, c_double)
         status = int(st, c_int)
     end function beta_param_cache_node_radius_and_derivative
 
     !===========================================================================
-    ! STANDALONE COMPUTES (tier 1)
+    ! ONE-SHOT COMPUTES (tier 1)
     !===========================================================================
 
-    !> One-shot R at caller thetas; builds and discards its own tables.
+    !> One-shot R at caller thetas; builds and discards its own cache.
     function beta_param_radius_grid_standalone(params, n_params, thetas, n_thetas, &
             conserve_volume, apply_com, radii) &
             result(status) bind(c, name = 'beta_param_radius_grid_standalone')
@@ -463,16 +480,24 @@ contains
         real(c_double), intent(out) :: radii(n_thetas)
         integer(c_int) :: status
 
+        real(kind = rk), allocatable :: params_f(:), thetas_f(:), radii_f(:)
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(n_params), thetas_f(n_thetas), radii_f(n_thetas)
+        integer :: alloc_stat
 
         radii = 0.0_c_double
-        if (n_params < 0_c_int .or. n_thetas < 0_c_int) then
-            status = int(SHAPE_ERROR_INVALID_INIT, c_int)
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(SHAPE_ERROR_TOO_MANY_PARAMS, c_int)
             return
         end if
-        params_f = real(params, rk)
-        thetas_f = real(thetas, rk)
+        allocate(thetas_f(extent_f(n_thetas)), radii_f(extent_f(n_thetas)), &
+                stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(SHAPE_ERROR_INVALID_GRID, c_int)
+            return
+        end if
+        params_f(:) = real(params, rk)
+        thetas_f(:) = real(thetas, rk)
         call compute_radius_grid_standalone_s(params_f, thetas_f, &
                 conserve_volume /= 0_c_int, apply_com /= 0_c_int, radii_f, st)
         radii = real(radii_f, c_double)
@@ -489,18 +514,25 @@ contains
         real(c_double), intent(out) :: radii(n_thetas), dr_dthetas(n_thetas)
         integer(c_int) :: status
 
+        real(kind = rk), allocatable :: params_f(:), thetas_f(:), radii_f(:), dr_f(:)
         integer(kind = ik) :: st
-        real(kind = rk) :: params_f(n_params), thetas_f(n_thetas)
-        real(kind = rk) :: radii_f(n_thetas), dr_f(n_thetas)
+        integer :: alloc_stat
 
         radii      = 0.0_c_double
         dr_dthetas = 0.0_c_double
-        if (n_params < 0_c_int .or. n_thetas < 0_c_int) then
-            status = int(SHAPE_ERROR_INVALID_INIT, c_int)
+        allocate(params_f(extent_f(n_params)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(SHAPE_ERROR_TOO_MANY_PARAMS, c_int)
             return
         end if
-        params_f = real(params, rk)
-        thetas_f = real(thetas, rk)
+        allocate(thetas_f(extent_f(n_thetas)), radii_f(extent_f(n_thetas)), &
+                dr_f(extent_f(n_thetas)), stat = alloc_stat)
+        if (alloc_stat /= 0) then
+            status = int(SHAPE_ERROR_INVALID_GRID, c_int)
+            return
+        end if
+        params_f(:) = real(params, rk)
+        thetas_f(:) = real(thetas, rk)
         call compute_radius_and_derivative_standalone_s(params_f, thetas_f, &
                 conserve_volume /= 0_c_int, apply_com /= 0_c_int, radii_f, dr_f, st)
         radii      = real(radii_f, c_double)

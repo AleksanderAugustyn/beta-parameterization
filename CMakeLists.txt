@@ -43,6 +43,7 @@ create_fortran_library_interface(TARGET beta_parameterization_flags)
 set(BETA_PARAM_SOURCES
         src/beta_parameterization_workers_mod.f08
         src/beta_parameterization_mod.f08
+        src/beta_parameterization_c_api_mod.f08
 )
 
 # --- No LTO for the library's own objects ---
@@ -162,5 +163,10 @@ add_custom_target(test_beta_pes_sweep
         COMMAND beta_pes_sweep
         DEPENDS beta_pes_sweep
         COMMENT "Running the PES-range sweep (1.55M + 172.8k shapes)")
+
+# C API smoke test: links the SHARED library, the binary the bindings load.
+add_executable(c_api_smoke_test tests/c_api_smoke_test.cpp)
+target_link_libraries(c_api_smoke_test PRIVATE beta_parameterization_cxx)
+add_test(NAME c_api_smoke COMMAND c_api_smoke_test)
 
 endif ()
