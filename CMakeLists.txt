@@ -45,6 +45,16 @@ set(BETA_PARAM_SOURCES
         src/beta_parameterization_mod.f08
 )
 
+# --- No LTO for the library's own objects ---
+# Release builds use -flto=auto -ffast-math. With LTO the summation kernels are
+# inlined into every caller and optimized per call site, so the same call can
+# return different last bits from different call sites — which breaks the
+# contract's bitwise guarantees (one-shot == cached, statelessness,
+# concurrency). Compiled without LTO, each kernel is ONE machine-code body that
+# every caller executes. Consumers keep LTO for their own code.
+# Source-file property so it lands after the flags-interface options (last wins).
+set_source_files_properties(${BETA_PARAM_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-lto")
+
 # --- Static library target ---
 add_library(beta_parameterization STATIC ${BETA_PARAM_SOURCES})
 target_link_libraries(beta_parameterization
@@ -118,7 +128,7 @@ target_include_directories(beta_param_test_utils PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/mod_files_tests>)
 
 set(BETA_PARAM_TEST_SUITES status lifecycle resolve outputs standalone property golden
-        equivalence)
+        equivalence statelessness)
 foreach (suite IN LISTS BETA_PARAM_TEST_SUITES)
     add_executable(beta_param_${suite}_test tests/beta_param_${suite}_test.f08)
     target_link_libraries(beta_param_${suite}_test PRIVATE
