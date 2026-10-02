@@ -321,9 +321,14 @@ contains
 
         real(kind = rk) :: volume_integral, z_num, z_num_deriv, z_cm, vf, n_prime
 
-        n_iter = 0_ik
+        n_iter    = 0_ik
+        converged = .false.
         call compute_newton_com_integrals_s(beta_con, gl_nodes, gl_weights, &
                 legendre_gl, volume_integral, z_num, z_num_deriv)
+        ! A non-positive volume integral has no real cube root: the shape is
+        ! far outside the valid domain, so report non-convergence instead of
+        ! evaluating (2 / volume_integral)**(1/3) on a negative base.
+        if (volume_integral <= 0.0_rk) return
         vf = (2.0_rk / volume_integral)**(1.0_rk / 3.0_rk)
         z_cm = 3.0_rk * z_num * vf**3 / 8.0_rk
         do while (abs(z_cm) >= CM_TOLERANCE .and. n_iter < MAX_ITERATIONS)
@@ -336,6 +341,7 @@ contains
             beta_con(1)   = beta_local(1) * norm_constants(1)
             call compute_newton_com_integrals_s(beta_con, gl_nodes, gl_weights, &
                     legendre_gl, volume_integral, z_num, z_num_deriv)
+            if (volume_integral <= 0.0_rk) return
             vf = (2.0_rk / volume_integral)**(1.0_rk / 3.0_rk)
             z_cm = 3.0_rk * z_num * vf**3 / 8.0_rk
         end do

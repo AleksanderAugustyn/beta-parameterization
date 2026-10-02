@@ -9,7 +9,8 @@ program beta_param_standalone_test
             compute_radius_grid_standalone_s, &
             compute_radius_and_derivative_standalone_s, &
             SHAPE_VALID, SHAPE_ERROR_TOO_MANY_PARAMS, SHAPE_ERROR_INVALID_GRID, &
-            SHAPE_ERROR_INVALID_INIT, BETA_PARAM_ERROR_INVALID_BUFFER_SIZE
+            SHAPE_ERROR_INVALID_INIT, BETA_PARAM_ERROR_INVALID_BUFFER_SIZE, &
+            BETA_PARAM_ERROR_COM_NOT_CONVERGED, BETA_PARAM_ERROR_NORTH_POLE
     implicit none
 
     type(cache_t) :: cache
@@ -93,6 +94,22 @@ program beta_param_standalone_test
             'wrong-length derivative buffer rejected with 104')
     call assert_close(maxval(abs(radii_sa)), 0.0_rk, 0.0_rk, 'bad buffer zero-fills radii')
     call assert_close(maxval(abs(dr_bad)), 0.0_rk, 0.0_rk, 'bad buffer zero-fills derivatives')
+
+    !---------------------------------------------------------------------------
+    ! 6. COM guard: a negative volume integral must not reach the cube root.
+    !    beta20 = -20 gives sum(w R^3) ~ -36.5; with COM that is a 103, without
+    !    COM the north pole fails first.
+    !---------------------------------------------------------------------------
+    radii_sa(:) = 1.0_rk
+    call compute_radius_grid_standalone_s([0.0_rk, -20.0_rk], thetas, .false., .true., &
+            radii_sa, status)
+    call assert_int_eq(status, BETA_PARAM_ERROR_COM_NOT_CONVERGED, &
+            'negative volume integral with COM rejected with 103')
+    call assert_close(maxval(abs(radii_sa)), 0.0_rk, 0.0_rk, 'COM failure zero-fills radii')
+    call compute_radius_grid_standalone_s([0.0_rk, -20.0_rk], thetas, .false., .false., &
+            radii_sa, status)
+    call assert_int_eq(status, BETA_PARAM_ERROR_NORTH_POLE, &
+            'same vector without COM rejected with 100')
 
     call test_summary()
 
