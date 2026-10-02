@@ -5,6 +5,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "beta-parameterization"
 description = "Python bindings for the beta (Legendre) nuclear-shape parameterization library"
+readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.9"
@@ -13,6 +14,11 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/AleksanderAugustyn/beta-parameterization"
+Repository = "https://github.com/AleksanderAugustyn/beta-parameterization"
+Changelog = "https://github.com/AleksanderAugustyn/beta-parameterization/blob/master/CHANGELOG.md"
 
 [tool.scikit-build]
 cmake.source-dir = "."
