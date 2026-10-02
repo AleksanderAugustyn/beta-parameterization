@@ -33,8 +33,10 @@
  *
  * Precondition — finite input: `params` (and every theta) must be finite.
  * Non-finite input is undefined behavior; the library cannot detect NaN under
- * fast-math, so a NaN parameter yields Status::valid with NaN outputs instead
- * of an error. Screen inputs before calling.
+ * fast-math, so no check rejects it, and no particular result is promised. A
+ * NaN parameter may yield Status::valid with NaN outputs; a NaN trailing
+ * parameter is trimmed like a zero, giving the finite outputs of the shorter
+ * vector. Screen inputs before calling.
  */
 
 #ifndef BETA_PARAMETERIZATION_HPP

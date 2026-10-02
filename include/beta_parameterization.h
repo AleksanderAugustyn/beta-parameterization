@@ -56,11 +56,13 @@
  *
  * Precondition — finite input:
  *   `params` and `thetas` must be finite. Non-finite input is undefined
- *   behavior: the library cannot detect NaN under fast-math, so validation
- *   comparisons silently pass and the call returns BETA_PARAM_VALID (0) with
- *   NaN outputs. Screen inputs before calling. Magnitudes must be physical as
- *   well: with `apply_com` the centre-of-mass quadrature evaluates R^4 before
- *   any validity gate and overflows for |beta| beyond about 1e70.
+ *   behavior: the library cannot detect NaN under fast-math, so no check
+ *   rejects it, and no particular result is promised. A call may return
+ *   BETA_PARAM_VALID (0) with NaN outputs; a NaN trailing parameter is
+ *   trimmed like a zero, giving the finite outputs of the shorter vector; a
+ *   Debug build may trap. Screen inputs before calling. Magnitudes must be
+ *   physical as well: with `apply_com` the centre-of-mass quadrature evaluates
+ *   R^4 before any validity gate and overflows for |beta| beyond about 1e70.
  */
 
 #ifndef BETA_PARAMETERIZATION_H

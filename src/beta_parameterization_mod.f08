@@ -46,10 +46,12 @@
 !! ## Precondition: finite input
 !!
 !! `params` (and every theta) must be finite. Non-finite input is UNDEFINED
-!! BEHAVIOR — the library cannot detect NaN under fast-math, so the validity
-!! gate silently passes and the call returns `SHAPE_VALID` (0) with NaN
-!! outputs. No runtime NaN check exists on any path; screen inputs before
-!! calling.
+!! BEHAVIOR — the library cannot detect NaN under fast-math, so no check
+!! rejects it, and no particular result is promised: a call may return
+!! `SHAPE_VALID` (0) with NaN outputs; a NaN trailing parameter is
+!! trimmed like a zero, giving the finite outputs of the shorter vector; a
+!! Debug build may trap. No runtime NaN check exists on any path; screen
+!! inputs before calling.
 !!
 !! Magnitudes must be physical as well. With `apply_com` the COM quadrature
 !! evaluates R**4 before any validity gate, which overflows for |beta| beyond

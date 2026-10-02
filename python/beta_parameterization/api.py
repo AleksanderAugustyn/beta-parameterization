@@ -199,9 +199,11 @@ def radius_grid(params: npt.ArrayLike, thetas: npt.ArrayLike,
     Notes
     -----
     ``params`` and ``thetas`` must be finite. Non-finite input is undefined
-    behavior: the library cannot detect NaN under fast-math, so the call
-    returns ``Status.valid`` with NaN radii instead of an error. Screen inputs
-    before calling.
+    behavior: the library cannot detect NaN under fast-math, so no check
+    rejects it, and no particular result is promised. The call may return
+    ``Status.valid`` with NaN radii; a NaN trailing parameter is
+    trimmed like a zero, giving the finite radii of the shorter vector.
+    Screen inputs before calling.
 
     The result is bitwise identical to :meth:`Cache.radius_grid` on a cache
     with ``max_params >= len(params)`` over the same thetas.
@@ -277,8 +279,10 @@ class Cache:
     Notes
     -----
     Every ``params`` array (and ``thetas``) must be finite. Non-finite input is
-    undefined behavior: the library cannot detect NaN under fast-math, so
-    compute calls return ``Status.valid`` with NaN outputs instead of an error.
+    undefined behavior: the library cannot detect NaN under fast-math, so no
+    check rejects it, and no particular result is promised. A compute call may
+    return ``Status.valid`` with NaN outputs; a NaN trailing parameter is
+    trimmed like a zero, giving the finite outputs of the shorter vector.
     Screen inputs before calling.
     """
 
