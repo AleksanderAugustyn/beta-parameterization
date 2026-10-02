@@ -169,4 +169,12 @@ add_executable(c_api_smoke_test tests/c_api_smoke_test.cpp)
 target_link_libraries(c_api_smoke_test PRIVATE beta_parameterization_cxx)
 add_test(NAME c_api_smoke COMMAND c_api_smoke_test)
 
+# Contract family 3 (concurrency): many threads on one shared cache, via the
+# C++ wrapper.
+find_package(Threads REQUIRED)
+add_executable(thread_stress_test tests/thread_stress_test.cpp)
+target_link_libraries(thread_stress_test PRIVATE
+        beta_parameterization_cxx Threads::Threads)
+add_test(NAME thread_stress COMMAND thread_stress_test)
+
 endif ()
