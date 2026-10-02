@@ -1,10 +1,12 @@
-"""High-level API: Status, result objects, Cache, standalone functions.
+"""High-level API: Status, result objects, Cache, one-shot functions.
 
 Two tiers, matching the C API. The module-level functions build, use and
-discard their own tables per call; :class:`Cache` keeps the per-shape working
-state so a sweep only recomputes what changed.
+discard their own cache per call; :class:`Cache` holds the tables that depend
+only on ``max_params`` and the theta set, built once and reused for any number
+of shapes.
 
-A cache is THREAD-CONFINED (3.0.0 breaking change): give every thread its own.
+A :class:`Cache` is immutable after construction and may be shared between
+threads. ``conserve_volume`` and ``apply_com`` are per-call options.
 
 Shape-validation failures come back as result objects carrying a
 :class:`Status`; :class:`BetaParamError` is raised only for usage errors — a
@@ -20,7 +22,7 @@ from typing import Optional
 import numpy as np
 import numpy.typing as npt
 
-from ._cdefs import CACHE_MAX_PARAMS, MAX_BETA_PARAMS_LIMIT, c_dbl_p, configure
+from ._cdefs import MAX_BETA_PARAMS_LIMIT, c_dbl_p, configure
 from ._libloader import load_library
 
 _lib: Optional[ctypes.CDLL] = None
@@ -41,8 +43,8 @@ class BetaParamError(RuntimeError):
 class Status(IntEnum):
     """Status codes of the C API (``BETA_PARAM_*`` in the header).
 
-    0-6 are the shared shape-parameterization contract codes; 100+ are this
-    library's own codes, append-only after 3.0.0.
+    0-5 are the shared shape-parameterization contract codes (6 is retired);
+    100+ are this library's own codes, append-only.
     """
 
     valid = 0
@@ -51,7 +53,6 @@ class Status(IntEnum):
     invalid_grid = 3
     wrong_param_count = 4
     invalid_init = 5
-    tables_not_initialized = 6
     north_pole = 100
     south_pole = 101
     interior_negative = 102
@@ -121,7 +122,7 @@ class ResolvedShape:
 
     ``corrected_beta10`` is a beta-space value and is never volume-scaled;
     ``r_north`` and ``r_south`` are. ``volume_factor`` is exactly 1.0 when the
-    cache was created with ``conserve_volume=False``.
+    shape was resolved with ``conserve_volume=False``.
     """
 
     corrected_beta10: float
@@ -177,7 +178,7 @@ def _ptr(arr: npt.NDArray[np.float64]) -> ctypes.POINTER(ctypes.c_double):  # ty
 def radius_grid(params: npt.ArrayLike, thetas: npt.ArrayLike,
                 conserve_volume: bool = False,
                 apply_com: bool = False) -> RadiusGridResult:
-    """R(theta) for one shape, tables built and discarded per call.
+    """R(theta) for one shape, a cache built and discarded per call.
 
     Parameters
     ----------
@@ -199,8 +200,11 @@ def radius_grid(params: npt.ArrayLike, thetas: npt.ArrayLike,
     -----
     ``params`` and ``thetas`` must be finite. Non-finite input is undefined
     behavior: the library cannot detect NaN under fast-math, so the call
-    returns ``Status.VALID`` with NaN radii instead of an error. Screen inputs
+    returns ``Status.valid`` with NaN radii instead of an error. Screen inputs
     before calling.
+
+    The result is bitwise identical to :meth:`Cache.radius_grid` on a cache
+    with ``max_params >= len(params)`` over the same thetas.
     """
     p = _as_1d(params, "params")
     t = _as_1d(thetas, "thetas")
@@ -214,7 +218,7 @@ def radius_grid(params: npt.ArrayLike, thetas: npt.ArrayLike,
 def radius_and_derivative(params: npt.ArrayLike, thetas: npt.ArrayLike,
                           conserve_volume: bool = False,
                           apply_com: bool = False) -> RadiusDerivativeResult:
-    """R(theta) and dR/dtheta for one shape, tables discarded per call.
+    """R(theta) and dR/dtheta for one shape, a cache discarded per call.
 
     Parameters
     ----------
@@ -231,6 +235,10 @@ def radius_and_derivative(params: npt.ArrayLike, thetas: npt.ArrayLike,
     -------
     RadiusDerivativeResult
         Radii, derivatives and status; both buffers zero-filled on failure.
+
+    Notes
+    -----
+    ``params`` and ``thetas`` must be finite; see :func:`radius_grid`.
     """
     p = _as_1d(params, "params")
     t = _as_1d(thetas, "thetas")
@@ -245,24 +253,21 @@ def radius_and_derivative(params: npt.ArrayLike, thetas: npt.ArrayLike,
 
 
 class Cache:
-    """Per-shape working state over a fixed theta set.
+    """Read-only tables over a fixed theta set, reused for any number of shapes.
 
-    Create once, evaluate many shapes: only the intermediates invalidated by
-    the changed parameters are recomputed. THREAD-CONFINED — every compute
-    call mutates the cache, so give each thread its own.
+    Create once, evaluate many shapes. Nothing parameter-dependent is stored:
+    every method computes its result from ``params`` alone, so calls are
+    independent and a ``Cache`` may be shared between threads. ``close()`` must
+    not race with a compute.
 
     Parameters
     ----------
-    n_params : int
-        Exact length every later ``params`` array must have,
-        1 .. ``CACHE_MAX_PARAMS``.
+    max_params : int
+        Longest ``params`` array the cache accepts, 1 .. ``MAX_BETA_PARAMS_LIMIT``.
+        A shorter array is accepted; its missing trailing parameters are zero.
     thetas : array_like
         Evaluation angles in radians; at least 2, none at a pole. See
         :func:`theta_grid`.
-    conserve_volume : bool, optional
-        Rescale radii to fixed volume.
-    apply_com : bool, optional
-        Apply the centre-of-mass correction.
 
     Raises
     ------
@@ -273,20 +278,16 @@ class Cache:
     -----
     Every ``params`` array (and ``thetas``) must be finite. Non-finite input is
     undefined behavior: the library cannot detect NaN under fast-math, so
-    compute calls return ``Status.VALID`` with NaN outputs instead of an error.
+    compute calls return ``Status.valid`` with NaN outputs instead of an error.
     Screen inputs before calling.
     """
 
-    def __init__(self, n_params: int, thetas: npt.ArrayLike,
-                 conserve_volume: bool = False,
-                 apply_com: bool = False) -> None:
+    def __init__(self, max_params: int, thetas: npt.ArrayLike) -> None:
         lib = _get_lib()
         t = _as_1d(thetas, "thetas")
         create_status = ctypes.c_int(0)
         handle = lib.beta_param_cache_create(
-            int(n_params), _ptr(t), t.size,
-            int(bool(conserve_volume)), int(bool(apply_com)),
-            ctypes.byref(create_status))
+            int(max_params), _ptr(t), t.size, ctypes.byref(create_status))
         if not handle:
             raise BetaParamError(
                 f"Cache creation failed: {status_message(create_status.value)} "
@@ -294,10 +295,8 @@ class Cache:
         self._handle: Optional[ctypes.c_void_p] = ctypes.c_void_p(handle)
         # Bound here so __del__ never needs module globals during shutdown.
         self._destroy = lib.beta_param_cache_destroy
-        self.n_params = int(n_params)
+        self.max_params = int(max_params)
         self.n_thetas = int(t.size)
-        self.conserve_volume = bool(conserve_volume)
-        self.apply_com = bool(apply_com)
 
     def close(self) -> None:
         """Destroy the underlying handle. Idempotent."""
@@ -321,42 +320,108 @@ class Cache:
             raise BetaParamError("Cache is closed")
         return handle
 
-    def radius_grid(self, params: npt.ArrayLike) -> RadiusGridResult:
-        """R(theta) at the cache's thetas, validated and volume-scaled."""
+    def radius_grid(self, params: npt.ArrayLike,
+                    conserve_volume: bool = False,
+                    apply_com: bool = False) -> RadiusGridResult:
+        """R(theta) at the cache's thetas, validated.
+
+        Parameters
+        ----------
+        params : array_like
+            Beta parameters, 1 .. ``max_params`` entries.
+        conserve_volume : bool, optional
+            Rescale radii to fixed volume.
+        apply_com : bool, optional
+            Apply the centre-of-mass correction.
+
+        Returns
+        -------
+        RadiusGridResult
+            Radii and status; radii are zero-filled on failure.
+        """
         handle = self._require_handle()
         p = _as_1d(params, "params")
         radii = np.zeros(self.n_thetas, dtype=np.float64)
         status = _get_lib().beta_param_cache_radius_grid(
-            handle, _ptr(p), p.size, _ptr(radii), radii.size)
+            handle, _ptr(p), p.size,
+            int(bool(conserve_volume)), int(bool(apply_com)),
+            _ptr(radii), radii.size)
         return RadiusGridResult(radii=radii, status=Status(status))
 
-    def radius_and_derivative(self, params: npt.ArrayLike) -> RadiusDerivativeResult:
-        """R(theta) and dR/dtheta at the cache's thetas."""
+    def radius_and_derivative(self, params: npt.ArrayLike,
+                              conserve_volume: bool = False,
+                              apply_com: bool = False) -> RadiusDerivativeResult:
+        """R(theta) and dR/dtheta at the cache's thetas.
+
+        Parameters
+        ----------
+        params : array_like
+            Beta parameters, 1 .. ``max_params`` entries.
+        conserve_volume : bool, optional
+            Rescale radii and derivatives to fixed volume.
+        apply_com : bool, optional
+            Apply the centre-of-mass correction.
+
+        Returns
+        -------
+        RadiusDerivativeResult
+            Radii, derivatives and status; both zero-filled on failure.
+        """
         handle = self._require_handle()
         p = _as_1d(params, "params")
         radii = np.zeros(self.n_thetas, dtype=np.float64)
         dr_dtheta = np.zeros(self.n_thetas, dtype=np.float64)
         status = _get_lib().beta_param_cache_radius_and_derivative(
-            handle, _ptr(p), p.size, _ptr(radii), _ptr(dr_dtheta), radii.size)
+            handle, _ptr(p), p.size,
+            int(bool(conserve_volume)), int(bool(apply_com)),
+            _ptr(radii), _ptr(dr_dtheta), radii.size)
         return RadiusDerivativeResult(
             radii=radii, dr_dtheta=dr_dtheta, status=Status(status))
 
-    def radius_grid_unchecked(self, params: npt.ArrayLike) -> RadiusGridResult:
+    def radius_grid_unchecked(self, params: npt.ArrayLike,
+                              apply_com: bool = False) -> RadiusGridResult:
         """R(theta) with no validation gates and no volume scaling.
 
         The rendering path: a shape the checked path rejects still yields its
         (partly negative) outline instead of a zero-filled buffer. Only usage
-        errors are reported.
+        errors and a failed COM correction are reported. The radii are never
+        volume-scaled, which is why there is no ``conserve_volume`` option;
+        scale by :attr:`ResolvedShape.volume_factor` if they must match
+        :meth:`radius_grid`.
+
+        Parameters
+        ----------
+        params : array_like
+            Beta parameters, 1 .. ``max_params`` entries.
+        apply_com : bool, optional
+            Apply the centre-of-mass correction.
+
+        Returns
+        -------
+        RadiusGridResult
+            Unscaled radii and status.
         """
         handle = self._require_handle()
         p = _as_1d(params, "params")
         radii = np.zeros(self.n_thetas, dtype=np.float64)
         status = _get_lib().beta_param_cache_radius_grid_unchecked(
-            handle, _ptr(p), p.size, _ptr(radii), radii.size)
+            handle, _ptr(p), p.size, int(bool(apply_com)),
+            _ptr(radii), radii.size)
         return RadiusGridResult(radii=radii, status=Status(status))
 
-    def resolve_shape(self, params: npt.ArrayLike) -> ResolvedShape:
+    def resolve_shape(self, params: npt.ArrayLike,
+                      conserve_volume: bool = False,
+                      apply_com: bool = False) -> ResolvedShape:
         """Resolve a shape without evaluating a grid.
+
+        Parameters
+        ----------
+        params : array_like
+            Beta parameters, 1 .. ``max_params`` entries.
+        conserve_volume : bool, optional
+            Compute the volume factor and scale the polar radii by it.
+        apply_com : bool, optional
+            Apply the centre-of-mass correction.
 
         Returns
         -------
@@ -372,6 +437,7 @@ class Cache:
         volume_factor = ctypes.c_double(0.0)
         status = _get_lib().beta_param_cache_resolve_shape(
             handle, _ptr(p), p.size,
+            int(bool(conserve_volume)), int(bool(apply_com)),
             ctypes.byref(corrected_beta10), ctypes.byref(r_north),
             ctypes.byref(r_south), ctypes.byref(volume_factor))
         return ResolvedShape(
@@ -384,5 +450,5 @@ __all__ = [
     "BetaParamError", "Cache", "RadiusDerivativeResult", "RadiusGridResult",
     "ResolvedShape", "Status", "radius_and_derivative", "radius_grid",
     "status_message", "theta_grid",
-    "CACHE_MAX_PARAMS", "MAX_BETA_PARAMS_LIMIT",
+    "MAX_BETA_PARAMS_LIMIT",
 ]
