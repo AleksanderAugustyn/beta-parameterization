@@ -3,6 +3,96 @@
 All notable changes to this project are documented here. Versions follow
 semantic versioning; the format follows [Keep a Changelog](https://keepachangelog.com).
 
+## 4.0.0
+
+Adoption of the two-tier shape parameterization contract on
+`shape_core_mod` (fortran-foundations 3.0.0). The incremental tier is gone:
+one-shot functions plus one read-only cache, built once and shared across
+threads. Every public surface — Fortran, C, C++, Python — changes; nothing in
+3.x compiles against 4.0.0 unchanged.
+
+### Changed (breaking)
+
+- **One cache type.** `tables_t` is renamed `cache_t`; the mutable 3.x
+  `cache_t`, `cache_init_shared_s`, the shared-tables mode and the `target`
+  requirement are removed. `cache_init_s(cache, max_params, thetas, status)`.
+  C: `beta_param_cache_create(max_params, thetas, n_thetas, status)`; the
+  `tables` handle and `beta_param_cache_create_shared` are removed. C++:
+  `Tables` is removed, `Cache(max_params, thetas)`. Python:
+  `Cache(max_params, thetas)`.
+- **Caches are immutable and shareable.** Every compute takes the cache
+  read-only (`intent(in)`, `const` handle, `const` method) and is `pure` in
+  Fortran. Any number of threads may compute on one cache. The 3.0.0
+  thread-confinement rule is withdrawn.
+- **Options are per call.** `conserve_volume` and `apply_com` move from cache
+  creation to each compute, after `params` and before the outputs. One cache
+  serves every combination. `cache_radius_grid_unchecked_s` takes `apply_com`
+  only: it never volume-scales.
+- **`max_params` replaces `n_params`.** A cache accepts any vector of
+  `1 .. max_params` entries, up to 64 (the 8-parameter cap is gone). Missing
+  trailing parameters are zero.
+- **Node sets are built from a cache**:
+  `node_set_build_s(node_set, cache, thetas, status)`; argument order of the
+  node compute is `(cache, params, node_set, conserve_volume, apply_com, radii,
+  dr_dthetas, status)`. A node set serves a cache when it was built from a
+  cache with at least that cache's `max_params`
+  (`BETA_PARAM_ERROR_NODE_SET_MISMATCH` otherwise) — judged on the two
+  objects, no longer on the vector length.
+- **Status codes.** Code 6 (`SHAPE_ERROR_TABLES_NOT_INITIALIZED`) is retired
+  and never reused; an uninitialized cache passed to `node_set_build_s` now
+  returns 2. An empty one-shot vector returns 4 (was 5). `max_params > 64` at
+  init returns 1. C: a negative `n_thetas` returns 3 (was 5).
+- **Getters.** `cache_n_params_f` becomes `cache_max_params_f`; C++
+  `Cache::n_params()` becomes `max_params()`; Python `Cache.n_params` becomes
+  `max_params`, and the `conserve_volume` / `apply_com` attributes are gone.
+
+### Removed
+
+- The recompute engine and everything built on it: `cache_recompute_count_f`,
+  the `BETA_PARAM_I_*` indices, the dependency map, the minimality test suite.
+- `SHAPE_CACHE_MAX_PARAMS`, `SHAPE_STANDALONE_MAX_PARAMS`
+  (use `SHAPE_MAX_PARAMS`), `BETA_PARAM_CACHE_MAX_PARAMS`, Python
+  `CACHE_MAX_PARAMS`, `Status.tables_not_initialized`.
+
+### Added
+
+- **Trailing zeros are trimmed.** Both tiers reduce a vector to its last
+  nonzero entry before any arithmetic, so a short vector and its zero-padded
+  form return identical bits. Interior zeros are kept.
+- **README.md** with the shape definition, both tiers in Fortran, C and
+  Python, build instructions and version pins.
+- **CI on push and pull request** (`.github/workflows/tests.yml`): every suite
+  in Debug and Release, pytest against the built library, and the
+  manylinux2014 wheel build.
+- Test suites for the contract's families: `equivalence` (one-shot ≡ cached,
+  short ≡ zero-padded), `statelessness`, `boundary`, and a concurrency suite
+  running eight threads on one shared cache.
+
+### Fixed
+
+- **COM correction on a non-positive volume integral.** With `apply_com`, a
+  shape far outside the valid domain (for example `[0, -20]`) made the Newton
+  step take the cube root of a negative number: a floating-point trap in Debug
+  builds, and in Release a result that depended on a NaN comparison. The
+  iteration now reports non-convergence (103). Without `apply_com` such a
+  shape is still rejected by the validity gate (100).
+- **C API stack overflow on a large wrong size.** Marshalling buffers were
+  caller-sized automatic arrays; under Release a large wrong size argument
+  overflowed the stack before the size was checked. They are heap-allocated
+  now: the call returns `BETA_PARAM_ERROR_INVALID_BUFFER_SIZE`.
+- **Allocation failure in cache or node-set build** returns
+  `SHAPE_ERROR_INVALID_GRID` (3) instead of terminating the process.
+
+### Build
+
+- The library's own objects are compiled with `-fno-lto`. Under
+  `-flto -ffast-math` the summation kernels were inlined into each caller and
+  optimized per call site, so the same call could return different last bits
+  from different call sites. Without LTO every caller executes one machine-code
+  body per kernel, which is what makes the bitwise guarantees hold. Cost: about
+  30% on shape evaluation time. Consumers keep LTO for their own code.
+- fortran-foundations pin 2.4.0 → 3.0.0.
+
 ## 3.0.0
 
 Adoption of the three-tier shape parameterization contract against
